@@ -15,7 +15,7 @@ func (publisher *Publisher) startNotifyFlowHandler() {
 	publisher.disablePublishDueToFlowMu.Lock()
 	publisher.disablePublishDueToFlow = false // 初始化为允许发布
 	publisher.disablePublishDueToFlowMu.Unlock()
-
+	
 	for ok := range notifyFlowChan {
 		publisher.disablePublishDueToFlowMu.Lock()
 		if ok {
@@ -44,10 +44,10 @@ func (publisher *Publisher) startNotifyFlowHandler() {
 func (publisher *Publisher) startNotifyBlockedHandler() {
 	blocking := publisher.connManager.NotifyBlockedSafe(make(chan amqp.Blocking))
 	publisher.disablePublishDueToBlockedMu.Lock()
-	publisher.blockings = blocking // 保存引用，用于 Close() 时从广播列表移除
+	publisher.blocking = blocking // 保存引用，用于 Close() 时从广播列表移除
 	publisher.disablePublishDueToBlocked = false
 	publisher.disablePublishDueToBlockedMu.Unlock()
-
+	
 	for b := range blocking {
 		publisher.disablePublishDueToBlockedMu.Lock()
 		if b.Active {

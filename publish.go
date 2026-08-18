@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-
+	
 	amqp "github.com/rabbitmq/amqp091-go"
-
+	
 	"github.com/xmapst/xamqp/internal/manager/channel"
 	"github.com/xmapst/xamqp/internal/manager/connection"
 )
@@ -53,20 +53,20 @@ type Publisher struct {
 	connManager                *connection.Manager
 	reconnectErrCh             <-chan error
 	closeConnectionToManagerCh chan<- struct{}
-
+	
 	disablePublishDueToFlow   bool          // 流控禁止发布标志
 	disablePublishDueToFlowMu *sync.RWMutex // 保护流控标志的读写锁
-
+	
 	disablePublishDueToBlocked   bool          // TCP 阻塞禁止发布标志
 	disablePublishDueToBlockedMu *sync.RWMutex // 保护 TCP 阻塞标志的读写锁
-
+	
 	handlerMu            *sync.Mutex
 	notifyReturnHandler  func(r Return)
 	notifyPublishHandler func(p Confirmation)
-
+	
 	options PublisherOptions
-
-	blockings chan amqp.Blocking // 接收 TCP 阻塞事件的通道
+	
+	blocking chan amqp.Blocking // 接收 TCP 阻塞事件的通道
 }
 
 // PublisherConfirmation 多路由键发布时每条消息的延迟确认集合。
@@ -82,7 +82,7 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 	for _, optionFunc := range optionFuncs {
 		optionFunc(options)
 	}
-
+	
 	if conn.connManager == nil {
 		return nil, errors.New("connection manager can't be nil")
 	}
@@ -102,21 +102,21 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 	if err != nil {
 		return nil, err
 	}
-
+	
 	publisher.reconnectErrCh, publisher.closeConnectionToManagerCh = publisher.chanManager.NotifyReconnect()
-
+	
 	err = publisher.startup()
 	if err != nil {
 		return nil, err
 	}
-
+	
 	// ConfirmMode：注册空白处理器使通道进入 confirm 模式，实际处理由业务代码注册
 	if options.ConfirmMode {
 		publisher.NotifyPublish(func(_ Confirmation) {
 			// 空处理器：仅用于开启 confirm 模式，不处理具体确认事件
 		})
 	}
-
+	
 	// 后台 goroutine：监听重连事件，重连后重新初始化流控监听
 	go func() {
 		for err = range publisher.reconnectErrCh {
@@ -131,7 +131,7 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 			publisher.startPublishHandler()
 		}
 	}()
-
+	
 	return publisher, nil
 }
 
@@ -171,13 +171,13 @@ func (publisher *Publisher) PublishWithContext(
 	if publisher.disablePublishDueToFlow {
 		return fmt.Errorf("publishing blocked due to high flow on the server")
 	}
-
+	
 	publisher.disablePublishDueToBlockedMu.RLock()
 	defer publisher.disablePublishDueToBlockedMu.RUnlock()
 	if publisher.disablePublishDueToBlocked {
 		return fmt.Errorf("publishing blocked due to TCP block on the server")
 	}
-
+	
 	options := &PublishOptions{}
 	for _, optionFunc := range optionFuncs {
 		optionFunc(options)
@@ -185,7 +185,7 @@ func (publisher *Publisher) PublishWithContext(
 	if options.DeliveryMode == 0 {
 		options.DeliveryMode = Transient // 默认非持久化，获取更高吞吐量
 	}
-
+	
 	for _, routingKey := range routingKeys {
 		message := amqp.Publishing{}
 		message.ContentType = options.ContentType
@@ -202,7 +202,7 @@ func (publisher *Publisher) PublishWithContext(
 		message.Type = options.Type
 		message.UserId = options.UserID
 		message.AppId = options.AppID
-
+		
 		err := publisher.chanManager.PublishWithContextSafe(
 			ctx,
 			options.Exchange,
@@ -234,13 +234,13 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 	if publisher.disablePublishDueToFlow {
 		return nil, fmt.Errorf("publishing blocked due to high flow on the server")
 	}
-
+	
 	publisher.disablePublishDueToBlockedMu.RLock()
 	defer publisher.disablePublishDueToBlockedMu.RUnlock()
 	if publisher.disablePublishDueToBlocked {
 		return nil, fmt.Errorf("publishing blocked due to TCP block on the server")
 	}
-
+	
 	options := &PublishOptions{}
 	for _, optionFunc := range optionFuncs {
 		optionFunc(options)
@@ -248,9 +248,9 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 	if options.DeliveryMode == 0 {
 		options.DeliveryMode = Transient
 	}
-
+	
 	var deferredConfirmations []*amqp.DeferredConfirmation
-
+	
 	for _, routingKey := range routingKeys {
 		message := amqp.Publishing{}
 		message.ContentType = options.ContentType
@@ -267,7 +267,7 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 		message.Type = options.Type
 		message.UserId = options.UserID
 		message.AppId = options.AppID
-
+		
 		conf, err := publisher.chanManager.PublishWithDeferredConfirmWithContextSafe(
 			ctx,
 			options.Exchange,
@@ -293,7 +293,12 @@ func (publisher *Publisher) Close() {
 		publisher.options.Logger.Warnf("error while closing the channel: %v", err)
 	}
 	publisher.options.Logger.Infof("closing publisher...")
-	publisher.connManager.RemovePublisherBlockingReceiver(publisher.blockings)
+	publisher.disablePublishDueToBlockedMu.RLock()
+	blocking := publisher.blocking
+	publisher.disablePublishDueToBlockedMu.RUnlock()
+	if blocking != nil {
+		publisher.connManager.RemovePublisherBlockingReceiver(blocking)
+	}
 	go func() {
 		publisher.closeConnectionToManagerCh <- struct{}{}
 	}()
@@ -309,7 +314,7 @@ func (publisher *Publisher) NotifyReturn(handler func(r Return)) {
 	start := publisher.notifyReturnHandler == nil
 	publisher.notifyReturnHandler = handler
 	publisher.handlerMu.Unlock()
-
+	
 	if start {
 		publisher.startReturnHandler()
 	}
@@ -325,7 +330,7 @@ func (publisher *Publisher) NotifyPublish(handler func(p Confirmation)) {
 	shouldStart := publisher.notifyPublishHandler == nil
 	publisher.notifyPublishHandler = handler
 	publisher.handlerMu.Unlock()
-
+	
 	if shouldStart {
 		publisher.startPublishHandler()
 	}
@@ -339,7 +344,7 @@ func (publisher *Publisher) startReturnHandler() {
 		return
 	}
 	publisher.handlerMu.Unlock()
-
+	
 	go func() {
 		returns := publisher.chanManager.NotifyReturnSafe(make(chan amqp.Return, 1))
 		for ret := range returns {
@@ -360,12 +365,12 @@ func (publisher *Publisher) startPublishHandler() {
 	}
 	publisher.handlerMu.Unlock()
 	_ = publisher.chanManager.ConfirmSafe(false)
-
+	
 	go func() {
 		// 信号量控制并发数，防止大量确认事件导致 goroutine 数量无限增长
 		const maxConcurrentHandlers = 100
 		sem := make(chan struct{}, maxConcurrentHandlers)
-
+		
 		confirmationCh := publisher.chanManager.NotifyPublishSafe(make(chan amqp.Confirmation, 100))
 		for conf := range confirmationCh {
 			sem <- struct{}{}

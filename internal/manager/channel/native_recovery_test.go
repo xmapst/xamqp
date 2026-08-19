@@ -142,6 +142,93 @@ func TestHandleCancelOrStateChange_CancelEntersReconnectLoop(t *testing.T) {
 	}
 }
 
+// TestHandleCancelOrStateChange_CancelBranchKeepsDrainingStateChannel 是针对
+// 一个真实 goroutine 泄漏的回归测试。
+//
+// 背景：NotifyCancel 分支处理完就 return，之后再也不读 stateCh；但此时旧通道
+// 接下来一定还会推送 StateClosing、StateClosed 两个事件（reconnectLoop 里会
+// 关闭旧通道）。amqp091-go 投递状态变化用的是无保护的阻塞发送
+// （lifecycle.go 的 `ch <- sc`），而 stateCh 只有 1 个缓冲位：第一个事件填满
+// 缓冲，第二个事件就会让库内部那个投递协程永久卡死，且它后续的
+// close(ch)/removeListener 也永远执行不到——每次 basic.cancel 触发的通道
+// 重建都泄漏一个协程。
+//
+// 修复方式是在离开该分支前起一个排空协程。本测试模拟库的投递行为：
+// handleCancelOrStateChange 返回后连续塞入两个事件，第二次发送若在超时内
+// 无法完成，就说明没人在排空，泄漏依然存在。
+func TestHandleCancelOrStateChange_CancelBranchKeepsDrainingStateChannel(t *testing.T) {
+	spy := &spyLogger{}
+	closeSignal := make(chan struct{})
+	close(closeSignal)
+
+	m := &Manager{
+		logger:              spy,
+		closeSignal:         closeSignal,
+		reconnectInterval:   time.Hour,
+		dispatcher:          dispatcher.New(),
+		notifyConnReconnect: stubNotifyReconnect,
+	}
+
+	notifyCancelChan := make(chan string, 1)
+	notifyCancelChan <- "some-queue"
+	stateCh := make(chan *amqp.StateChanged, 1) // 与生产代码一致：缓冲为 1
+
+	m.handleCancelOrStateChange(notifyCancelChan, stateCh)
+
+	// 模拟旧通道关闭时库推送的两个事件。
+	send := func(sc *amqp.StateChanged) bool {
+		select {
+		case stateCh <- sc:
+			return true
+		case <-time.After(3 * time.Second):
+			return false
+		}
+	}
+
+	if !send(&amqp.StateChanged{To: amqp.StateClosing}) {
+		t.Fatal("first state change send blocked; the 1-slot buffer should have accepted it")
+	}
+	if !send(&amqp.StateChanged{To: amqp.StateClosed}) {
+		t.Fatal("second state change send blocked forever: nothing is draining the abandoned stateCh, " +
+			"so amqp091-go's delivery goroutine would be parked permanently (one leaked goroutine per basic.cancel)")
+	}
+
+	// 库在投递完终态后会关闭通道；排空协程应当据此退出。
+	close(stateCh)
+}
+
+// TestDrainStateChanges_ExitsWhenChannelClosed 验证排空协程在通道关闭后确实
+// 会退出（而不是自己变成另一个泄漏源），并且 nil 通道不会让它永久阻塞。
+func TestDrainStateChanges_ExitsWhenChannelClosed(t *testing.T) {
+	stateCh := make(chan *amqp.StateChanged, 1)
+	done := make(chan struct{})
+	go func() {
+		(&Manager{}).drainStateChanges(stateCh)
+		close(done)
+	}()
+
+	stateCh <- &amqp.StateChanged{To: amqp.StateClosing}
+	stateCh <- &amqp.StateChanged{To: amqp.StateClosed}
+	close(stateCh)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("drainStateChanges did not exit after the channel was closed")
+	}
+
+	nilDone := make(chan struct{})
+	go func() {
+		(&Manager{}).drainStateChanges(nil)
+		close(nilDone)
+	}()
+	select {
+	case <-nilDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("drainStateChanges blocked forever on a nil channel")
+	}
+}
+
 // TestHandleCancelOrStateChange_StateChannelClosedWithoutTerminalEvent 验证
 // stateCh 被关闭、但从未真正送达过任何终态事件时（例如通道对象在中途被
 // 直接销毁），函数会通过 `case sc, ok := <-stateCh: if !ok { return }`

@@ -267,6 +267,30 @@ func (m *Manager) NotifyPublishSafe(
 	)
 }
 
+// WithChannelForNewGeneration 在同一个读锁临界区内原子地完成三件事：
+// 读取当前通道的"代号"（重连计数）、把代号交给调用方判断是否需要为这一代
+// 注册监听、以及（需要时）在当前通道上完成注册。
+//
+// 存在的理由：调用方（Publisher）需要保证"每一代通道最多注册一个监听者"。
+// 如果分成"先取代号 → 解锁 → 再注册"两步，中间可能插入一次完整的重连，
+// 注册就会落到新通道上却记着旧代号，随后按新代号判断的调用方会再注册一次，
+// 同一个通道上出现两个监听者——而 amqp091-go 的 NotifyReturn/NotifyPublish
+// 允许多个监听者并会把每个事件广播给全部监听者、不做去重，结果就是每个
+// 事件被处理两次。读锁会挡住 reconnect() 的写锁，因此在 register 回调执行
+// 期间通道不可能被替换，代号与实际注册到的通道严格对应。
+//
+// register 为 nil（调用方判断这一代已经有监听者）时不做任何注册。
+// 注意：register 在持有 channelMu 读锁时被调用，实现里不得再去获取写锁
+// （例如不要调用 ConfirmSafe），否则会自锁。
+func (m *Manager) WithChannelForNewGeneration(
+	register func(ch *amqp.Channel, generation uint),
+) {
+	m.channelMu.RLock()
+	defer m.channelMu.RUnlock()
+
+	register(m.channel, m.ReconnectionCount())
+}
+
 // NotifyFlowSafe 线程安全地注册流控事件通道，接收服务器的 Flow 控制信号。
 func (m *Manager) NotifyFlowSafe(
 	c chan bool,

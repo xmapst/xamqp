@@ -124,6 +124,18 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 				notifyCancelChan = nil
 				continue
 			}
+			// 本分支之后不会再回到 select 读 stateCh，但旧通道接下来一定还会
+			// 推送 StateClosing/StateClosed 两个事件过来（reconnectLoop 里的
+			// reconnect() 会关闭旧通道）。amqp091-go 的 deliverToListener 用的是
+			// 无保护的阻塞发送（lifecycle.go 中的 `ch <- sc`），stateCh 只有 1 个
+			// 缓冲位：第一个事件填满缓冲，第二个事件就会让那个投递协程永久
+			// 卡死，且因为发送没完成，它后面的 close(ch)/removeListener 也永远
+			// 不会执行——每一次 basic.cancel 触发的通道重建都会泄漏一个协程。
+			// amqp091-go 在 NotifyStateChange 的文档里明确要求必须持续消费。
+			// 这里在离开前起一个纯排空协程，读到通道关闭为止（投递完终态
+			// StateClosed 后库会关闭它），让那个投递协程能够跑完并退出。
+			go m.drainStateChanges(stateCh)
+
 			m.logger.Errorf("attempting to reconnect to amqp server after cancel with error: %s", tag)
 			m.reconnectLoop()
 			m.logger.Warnf("successfully reconnected to amqp server after cancel")
@@ -153,6 +165,20 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			default:
 			}
 		}
+	}
+}
+
+// drainStateChanges 持续丢弃一个不再有人关心的 NotifyStateChange 通道上的事件，
+// 直到 amqp091-go 在投递完终态 StateClosed 后关闭它。
+//
+// 存在的唯一目的是避免泄漏：amqp091-go 投递状态变化用的是无保护的阻塞发送，
+// 一个没人消费的通道会让它的投递协程永久卡住（详见 handleCancelOrStateChange
+// 中放弃 stateCh 时的说明）。这里不需要处理任何事件，只需要把它们读走。
+func (m *Manager) drainStateChanges(stateCh <-chan *amqp.StateChanged) {
+	if stateCh == nil {
+		return
+	}
+	for range stateCh {
 	}
 }
 
@@ -213,10 +239,22 @@ func (m *Manager) reconnectLoop() {
 				m.logger.Infof("channel manager closed, stopping reconnect loop")
 				return
 			}
+			// 所属连接管理器已经被 Close：这不是可以靠重试恢复的瞬时错误，
+			// 通道永远不可能在一个已经关掉的连接上重建成功。必须显式识别
+			// 并退出，否则本协程会带着它对连接 dispatcher 的订阅（以及那个
+			// 订阅在 dispatcher 里对应的清理协程）一直重试到进程结束——
+			// connection.Manager.Close() 只关自己的 closeSignal，不会通知
+			// 任何子 channel.Manager，而 m.closeSignal 只有 channel.Manager
+			// 自己的 Close() 才会关闭。用户先关 Conn 再关 Consumer/Publisher
+			// （README 建议反过来，但没有强制）就会命中这条路径。
+			if m.connManager.IsClosed() {
+				m.logger.Infof("connection manager is closed, stopping channel reconnect loop")
+				return
+			}
 			m.logger.Errorf("error reconnecting to amqp server: %v", err)
 			attempt++
 		} else {
-			m.incrementReconnectionCount()
+			// 重连计数已在 reconnect() 内与通道装入原子地一起递增，此处不再重复递增。
 			go m.startNotifyCancelOrClosed() // 重连成功后继续监听新通道的异常
 			return
 		}
@@ -267,6 +305,13 @@ func (m *Manager) reconnect() error {
 
 	oldChannel := m.channel
 	m.channel = newChannel
+	// 在装入新通道的同一个写锁临界区内递增重连计数，使"当前通道"和
+	// "当前重连计数"始终是一致的一对：任何在 channelMu 读锁下同时观察这
+	// 两者的调用方（见 WithChannelForNewGeneration）都不会看到"通道已经换成
+	// 新的、计数还停留在旧值"的中间状态。Publisher 用这个计数当作通道的
+	// 代号来给监听协程去重，若两者不同步，代号就不再能唯一标识一个通道，
+	// 会导致同一个通道被注册两个监听者、每个事件被投递两次。
+	m.incrementReconnectionCount()
 	m.channelMu.Unlock()
 
 	// 先建立新通道，再关闭旧通道，防止期间有操作无通道可用

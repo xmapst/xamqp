@@ -46,6 +46,12 @@ type Consumer struct {
 
 	isClosedMu *sync.RWMutex // 保护 isClosed 的并发读写
 	isClosed   bool          // 是否已关闭，关闭后拒绝处理新消息、停止重连恢复
+
+	// cleanupOnce 保证真正的资源清理（关闭通道、取消订阅）只执行一次。
+	// 不能再像以前那样用 isClosed 兼任幂等标志：CloseWithContext 现在会
+	// 先标记关闭再等待处理完成，等它调用 cleanupResources 时标记早已置上，
+	// 用标记做短路会导致资源根本不被释放。
+	cleanupOnce sync.Once
 }
 
 // Delivery 封装 amqp.Delivery，代表从队列收到的一条待处理消息。
@@ -169,13 +175,17 @@ func (consumer *Consumer) Close() {
 // closeConnectionToManagerCh 发送（后者若不加保护，每次重复调用都会
 // 泄漏一个永远阻塞在发送上的 goroutine，因为取消订阅信号只被接收一次）。
 func (consumer *Consumer) cleanupResources() {
-	consumer.isClosedMu.Lock()
-	if consumer.isClosed {
-		consumer.isClosedMu.Unlock()
+	// 注意这里不能用 markClosed 的返回值做幂等短路：CloseWithContext 会先
+	// 调用一次 markClosed 再进入等待，等它走到这里时标记必然已经置上了，
+	// 若据此提前返回就再也不会真正关闭通道、取消订阅。幂等改由
+	// cleanupOnce 保证，它与"是否已标记关闭"是两件独立的事。
+	consumer.markClosed()
+
+	cleaned := false
+	consumer.cleanupOnce.Do(func() { cleaned = true })
+	if !cleaned {
 		return
 	}
-	consumer.isClosed = true
-	consumer.isClosedMu.Unlock()
 
 	// 关闭 AMQP 通道通知 RabbitMQ 服务器停止投递消息
 	err := consumer.chanManager.Close()
@@ -193,7 +203,19 @@ func (consumer *Consumer) cleanupResources() {
 //
 // 若 WithConsumerOptionsForceShutdown 选项开启（CloseGracefully=false），
 // 则不等待，立即关闭。
+//
+// 先标记关闭、再等待处理完成，顺序不能反过来：markClosed 之后
+// handlerGoroutine 的 getIsClosed 检查会让它停止从 msgs 取新消息，
+// 于是"等待读锁全部释放"才真正等价于"所有消息处理完毕"。若像之前那样
+// 先等待再标记，waitForHandlerCompletion 拿到写锁后会立刻释放
+// （defer Unlock），而此时 isClosed 仍是 false，handlerGoroutine 完全
+// 可以在这个空档里取走一条已经预取到本地的消息并启动新的 handler——
+// Close() 就会在用户 handler 仍在执行时返回，之后通道被关闭，
+// 这条消息的 Ack 失败并被重投，而调用方以为优雅关闭已经完成、
+// 可能已经拆掉了 handler 依赖的数据库连接池等资源。
 func (consumer *Consumer) CloseWithContext(ctx context.Context) {
+	consumer.markClosed()
+
 	if consumer.options.CloseGracefully {
 		consumer.options.Logger.Infof("waiting for handler to finish...")
 		err := consumer.waitForHandlerCompletion(ctx)
@@ -203,6 +225,18 @@ func (consumer *Consumer) CloseWithContext(ctx context.Context) {
 	}
 
 	consumer.cleanupResources()
+}
+
+// markClosed 幂等地把消费者标记为已关闭。
+//
+// 单独抽出来是为了让 CloseWithContext 能在开始等待之前就先阻止新消息
+// 进入处理流程，而 cleanupResources 仍然可以独立地再标记一次
+// （直接调用 cleanupResources 的路径下它是唯一的标记者）。
+func (consumer *Consumer) markClosed() {
+	consumer.isClosedMu.Lock()
+	defer consumer.isClosedMu.Unlock()
+
+	consumer.isClosed = true
 }
 
 // startGoroutines 声明 AMQP 资源并为每个并发度启动一个消费 goroutine。

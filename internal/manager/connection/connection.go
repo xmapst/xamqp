@@ -124,8 +124,15 @@ func New(url string, conf amqp.Config, log logger.ILogger, reconnectInterval tim
 		return nil, err
 	}
 	connManager.connection = conn
-	go connManager.startNotifyClose()                                                      // 监听连接关闭事件
-	go connManager.readUniversalBlockReceiver(connManager.universalNotifyBlockingReceiver) // 广播 TCP 阻塞信号给所有 Publisher
+	go connManager.startNotifyClose() // 监听连接关闭事件
+	// 注意：readUniversalBlockReceiver 不在这里启动。它只有在有 Publisher 通过
+	// NotifyBlockedSafe 真正注册阻塞通知时才会被启动（见 safe_wraps.go），此时
+	// universalNotifyBlockingReceiver 才会被注册进 m.connection.NotifyBlocked，
+	// 该 channel 才会在连接关闭时被 amqp091-go 关闭，range 循环才有退出的机会。
+	// 若在此处无条件启动，只使用 NewChannel/NewConsumer、从未创建过 Publisher
+	// 的 Conn 上，这个 channel 永远不会被注册也就永远不会被关闭，
+	// readUniversalBlockReceiver 的 `for b := range receiver` 会永久阻塞，
+	// 泄漏一个 goroutine 直到进程退出，即使调用了 Conn.Close() 也不例外。
 	return &connManager, nil
 }
 

@@ -29,6 +29,13 @@ type blockingReceiver struct {
 // 此方法将调用者注册到 publisherNotifyBlockingReceivers 列表中，
 // 由 readUniversalBlockReceiver 统一广播信号，
 // 解决多个 Publisher 共用同一连接时的信号分发问题。
+//
+// readUniversalBlockReceiver 懒启动：只有第一个 Publisher 真正调用本方法时
+// 才会启动广播 goroutine 并把 universalNotifyBlockingReceiver 注册进
+// m.connection.NotifyBlocked——只有注册过，这个 channel 才会在连接关闭时
+// 被 amqp091-go 关闭，广播 goroutine 的 range 循环才有退出的机会。若从不
+// 调用本方法（只用 NewChannel/NewConsumer、从未创建过 Publisher），
+// 广播 goroutine 也就从未启动，不存在需要清理的东西。
 func (m *Manager) NotifyBlockedSafe(
 	receiver chan amqp.Blocking,
 ) chan amqp.Blocking {
@@ -43,12 +50,13 @@ func (m *Manager) NotifyBlockedSafe(
 	})
 	m.publisherNotifyBlockingReceiversMu.Unlock()
 
-	// 仅在第一个 Publisher 注册时，将通用通道注册给底层连接
+	// 仅在第一个 Publisher 注册时，将通用通道注册给底层连接并启动广播协程
 	if !m.universalNotifyBlockingReceiverUsed {
 		m.connection.NotifyBlocked(
 			m.universalNotifyBlockingReceiver,
 		)
 		m.universalNotifyBlockingReceiverUsed = true
+		go m.readUniversalBlockReceiver(m.universalNotifyBlockingReceiver)
 	}
 
 	return receiver

@@ -38,8 +38,17 @@ func (l testLogger) Debugf(format string, args ...any) { l.logf("DEBUG: "+format
 // prepareDockerTest 检查是否启用了集成测试；启用时用 docker 启动一个
 // 一次性的 RabbitMQ 容器，返回连接串，并注册测试结束时的清理。
 func prepareDockerTest(t *testing.T) (connStr string) {
+	// 若已经指定了外部 broker（见 leak_integration_test.go 的
+	// XAMQP_TEST_AMQP_URL），直接复用，不再启动 Docker 容器——
+	// 这样同一批功能用例既能在 CI 的 Docker 环境跑，也能对着一台
+	// 现成的 broker 跑。
+	if url := os.Getenv(externalAmqpURLEnv); url != "" {
+		return url
+	}
+
 	if v, ok := os.LookupEnv(enableDockerIntegrationTestsFlag); !ok || strings.ToUpper(v) != "TRUE" {
-		t.Skipf("integration tests are only run if '%s' is TRUE", enableDockerIntegrationTestsFlag)
+		t.Skipf("integration tests are only run if '%s' or '%s' is set",
+			enableDockerIntegrationTestsFlag, externalAmqpURLEnv)
 		return ""
 	}
 
@@ -198,11 +207,14 @@ func TestCloseIsIdempotent(t *testing.T) {
 }
 
 // TestPublisherConfirmModeSurvivesReconnect 验证 confirm 模式在通道
-// 因错误重连后依然生效：重连完成后再发布的消息应当仍然能拿到非 nil 的
+// 因错误恢复后依然生效：恢复完成后再发布的消息应当仍然能拿到非 nil 的
 // DeferredConfirmation，而不是静默丢失确认能力。
 //
-// 通过反复向一个不存在的 exchange 发布触发通道被 broker 关闭、进而重连，
-// 用 chanManager.ReconnectionCount() 的变化判断重连是否真的发生过。
+// 恢复的判据是"功能是否恢复"，不是 chanManager.ReconnectionCount() 是否变化。
+// 启用 amqp091-go 原生恢复之后，通道级软错误（这里的 NOT_FOUND）由底层库
+// 原地修复——同一个 *amqp.Channel 对象被复用，xamqp 自己的 reconnect() 根本
+// 不会被调用，那个计数器自然不会变。旧版本用计数器判断恢复，于是稳定超时
+// 失败：失败的是判据，不是功能（同样的失败在引入本判据之前的提交上也能复现）。
 func TestPublisherConfirmModeSurvivesReconnect(t *testing.T) {
 	connStr := prepareDockerTest(t)
 	conn := waitForHealthyAmqp(t, connStr, WithConnectionOptionsReconnectInterval(50*time.Millisecond))
@@ -214,33 +226,39 @@ func TestPublisherConfirmModeSurvivesReconnect(t *testing.T) {
 	}
 	defer publisher.Close()
 
-	reconnectionCount := publisher.chanManager.ReconnectionCount()
-
-	// 向一个不存在的 exchange 发布会导致 broker 以 NOT_FOUND 关闭通道，
-	// 触发 channel.Manager 的自动重连。
-	_ = publisher.Publish([]byte("trigger reconnect"), []string{"unused"},
+	// 向一个不存在的 exchange 发布会导致 broker 以 NOT_FOUND 关闭通道。
+	_ = publisher.Publish([]byte("trigger recovery"), []string{"unused"},
 		WithPublishOptionsExchange(fmt.Sprintf("xamqp-integration-missing-exchange-%d", time.Now().UnixNano())))
 
-	deadline := time.Now().Add(10 * time.Second)
-	for publisher.chanManager.ReconnectionCount() == reconnectionCount {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for the channel to reconnect")
+	// 轮询直到确认能力恢复：恢复窗口内发布失败或消息被 nack 都是正常的，
+	// 只有"始终恢复不了"才算缺陷。
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		confirmations, err := publisher.PublishWithDeferredConfirmWithContext(
+			context.Background(), []byte("confirmed after recovery"), []string{"unused"},
+		)
+		if err != nil {
+			lastErr = fmt.Errorf("publish failed: %w", err)
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
-		time.Sleep(50 * time.Millisecond)
+		if len(confirmations) != 1 || confirmations[0] == nil {
+			lastErr = fmt.Errorf("got %d confirmations, confirm mode appears lost", len(confirmations))
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, werr := confirmations[0].WaitContext(ctx)
+		cancel()
+		if werr != nil {
+			lastErr = fmt.Errorf("waiting for confirmation failed: %w", werr)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		return // 拿到了确认，确认模式在恢复后依然有效
 	}
-
-	confirmations, err := publisher.PublishWithDeferredConfirmWithContext(
-		context.Background(), []byte("confirmed after reconnect"), []string{"unused"},
-	)
-	if err != nil {
-		t.Fatalf("publish after reconnect failed: %v", err)
-	}
-	if len(confirmations) != 1 || confirmations[0] == nil {
-		t.Fatal("expected a non-nil DeferredConfirmation after reconnect; confirm mode was not restored on the new channel")
-	}
-	if _, err := confirmations[0].WaitContext(context.Background()); err != nil {
-		t.Fatalf("error waiting for confirmation after reconnect: %v", err)
-	}
+	t.Fatalf("confirm mode never recovered after a channel-level error within 30s: %v", lastErr)
 }
 
 // TestPublisherConfirmationsAllArriveExactlyOnce 验证开启确认模式后，

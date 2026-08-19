@@ -57,7 +57,12 @@ type Confirmation struct {
 //
 // 线程安全设计：
 //   - disablePublishDueToFlow/Blocked 通过 RWMutex 保护，读多写少场景性能高
-//   - notifyReturnHandler/notifyPublishHandler 通过 handlerMu 保护注册时的并发安全
+//   - notifyReturnHandler/notifyPublishHandler 通过 handlerMu 保护注册和读取的并发安全
+//     （invokeReturnHandler/invokePublishHandler 读取时也要加锁，不能只在注册时加锁）
+//   - returnHandlerGeneration/publishHandlerGeneration 同样受 handlerMu 保护，
+//     用于给 start*Handler 去重：NotifyReturn/NotifyPublish 与重连成功后的
+//     自动重启都会调用 start*Handler，没有这层去重会在同一通道上重复注册
+//     监听协程，导致每个事件被投递两次
 //
 // 流控机制：当 RabbitMQ 服务器资源紧张时会发送 Flow/Block 信号，
 // Publisher 收到信号后自动暂停发布，防止继续向过载的 Broker 发送消息。
@@ -77,9 +82,11 @@ type Publisher struct {
 	disablePublishDueToBlocked   bool          // TCP 阻塞禁止发布标志
 	disablePublishDueToBlockedMu *sync.RWMutex // 保护 TCP 阻塞标志的读写锁
 
-	handlerMu            *sync.Mutex          // 保护 notifyReturnHandler/notifyPublishHandler 注册时的并发安全
-	notifyReturnHandler  func(r Return)       // NotifyReturn 注册的 basic.return 处理函数，nil 表示未注册
-	notifyPublishHandler func(p Confirmation) // NotifyPublish 注册的发布确认处理函数，nil 表示未注册（未开启 confirm 模式）
+	handlerMu                *sync.Mutex          // 保护 notifyReturnHandler/notifyPublishHandler 及下面两个"代"号字段的并发安全
+	notifyReturnHandler      func(r Return)       // NotifyReturn 注册的 basic.return 处理函数，nil 表示未注册
+	notifyPublishHandler     func(p Confirmation) // NotifyPublish 注册的发布确认处理函数，nil 表示未注册（未开启 confirm 模式）
+	returnHandlerGeneration  int                  // 已成功为其启动过监听协程的通道"代"号（即当时的 chanManager.ReconnectionCount()），-1 表示尚未启动过
+	publishHandlerGeneration int                  // 同上，用于确认事件监听协程
 
 	options PublisherOptions // 创建时传入的发布者选项快照
 
@@ -114,6 +121,8 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 		handlerMu:                    &sync.Mutex{},
 		notifyReturnHandler:          nil,
 		notifyPublishHandler:         nil,
+		returnHandlerGeneration:      -1,
+		publishHandlerGeneration:     -1,
 		options:                      *options,
 	}
 	var err error
@@ -393,13 +402,15 @@ func (publisher *Publisher) Close() {
 // 把这个风险降到最低。
 func (publisher *Publisher) NotifyReturn(handler func(r Return)) {
 	publisher.handlerMu.Lock()
-	start := publisher.notifyReturnHandler == nil
 	publisher.notifyReturnHandler = handler
 	publisher.handlerMu.Unlock()
 
-	if start {
-		publisher.startReturnHandler()
-	}
+	// 无条件调用：是否真的需要启动一个新的监听协程，完全交给
+	// startReturnHandler 内部基于"代"号的原子判断，而不是在这里自己算一次
+	// "要不要启动"再重复判断一次——两次独立判断之间没有互斥，正是曾经
+	// 导致同一通道被重复注册两个监听协程、每个 basic.return 被投递两次的
+	// 根源（该竞态与重连后自动重启监听协程的后台协程之间产生）。
+	publisher.startReturnHandler()
 }
 
 // NotifyPublish 注册发布确认事件的处理函数，开启确认模式。
@@ -413,13 +424,12 @@ func (publisher *Publisher) NotifyReturn(handler func(r Return)) {
 // startPublishHandler），语义和取舍同 NotifyReturn。
 func (publisher *Publisher) NotifyPublish(handler func(p Confirmation)) {
 	publisher.handlerMu.Lock()
-	shouldStart := publisher.notifyPublishHandler == nil
 	publisher.notifyPublishHandler = handler
 	publisher.handlerMu.Unlock()
 
-	if shouldStart {
-		publisher.startPublishHandler()
-	}
+	// 无条件调用，理由同 NotifyReturn：去重判断完全交给 startPublishHandler
+	// 内部基于"代"号的原子判断。
+	publisher.startPublishHandler()
 }
 
 // startReturnHandler 启动 basic.return 事件监听 goroutine。
@@ -429,16 +439,48 @@ func (publisher *Publisher) NotifyPublish(handler func(p Confirmation)) {
 // 慢 handler 拖住——这个循环的读取速度直接决定 amqp091-go 共享的连接
 // 读取协程会不会被写阻塞（详见 NotifyReturn 文档），所以这里不能改成
 // 同步调用。代价是不保证多个 basic.return 之间的处理顺序。
+//
+// 去重：本方法可能被两条独立路径并发调用——用户直接调用 NotifyReturn，
+// 以及重连成功后 NewPublisher 里的后台协程自动重新调用一遍。两者之间
+// 没有互斥，若各自都认为"当前还没有监听协程、我来启动"，会各自在同一个
+// 通道上调用一次 NotifyReturnSafe，注册两个独立的监听者——amqp091-go
+// 的 NotifyReturn 支持多个并发监听者、且会把每个事件广播给所有监听者，
+// 不会去重，于是每个 basic.return 会被投递并处理两次。
+//
+// 用 returnHandlerGeneration（当时的 chanManager.ReconnectionCount()）
+// 而不是简单的布尔标志来去重：布尔标志无法区分"这一代通道已经启动过
+// 监听协程，不用再启动"和"通道已经变成下一代了，需要为新通道重新启动"，
+// 用重连计数作为代号可以天然地把这两种情况分开，且不依赖旧监听协程
+// 何时真正退出这种时序细节。
+//
+// 关键：判断代号和真正注册监听必须在同一个 channelMu 读锁临界区内原子完成
+// （WithChannelForNewGeneration），不能"先取代号、解锁、再由新协程去注册"——
+// 后者中间可以插入一次完整的重连，注册会落到新通道上却记着旧代号，随后
+// 按新代号判断的调用方会再注册一次，同一个通道上就有了两个监听者，事件
+// 被处理两次。外层的 handlerMu 负责把并发的多个调用方串行化，内层的
+// channelMu 读锁负责挡住重连，两者合起来才能真正保证"每一代通道最多一个
+// 监听协程"。
 func (publisher *Publisher) startReturnHandler() {
 	publisher.handlerMu.Lock()
+	defer publisher.handlerMu.Unlock()
+
 	if publisher.notifyReturnHandler == nil {
-		publisher.handlerMu.Unlock()
 		return
 	}
-	publisher.handlerMu.Unlock()
+
+	var returns chan amqp.Return
+	publisher.chanManager.WithChannelForNewGeneration(func(ch *amqp.Channel, generation uint) {
+		if publisher.returnHandlerGeneration == int(generation) {
+			return // 这一代通道已经有监听协程了，不重复注册
+		}
+		publisher.returnHandlerGeneration = int(generation)
+		returns = ch.NotifyReturn(make(chan amqp.Return, 100))
+	})
+	if returns == nil {
+		return
+	}
 
 	go func() {
-		returns := publisher.chanManager.NotifyReturnSafe(make(chan amqp.Return, 100))
 		for ret := range returns {
 			go publisher.invokeReturnHandler(Return{ret})
 		}
@@ -446,13 +488,24 @@ func (publisher *Publisher) startReturnHandler() {
 }
 
 // invokeReturnHandler 执行 basic.return 处理函数，通过 recover 保护防止 panic 影响整体。
+//
+// 在 handlerMu 保护下把 handler 函数值拷贝出来再解锁调用：notifyReturnHandler
+// 只在 NotifyReturn 里加锁写入，若在这里不加锁直接读字段，与那次写入之间
+// 就是未同步的并发读写（数据竞争，go test -race 会报出来），即使实践中
+// 一次函数指针赋值很少真的产生撕裂读，也不应该依赖这种运气。不在持锁期间
+// 调用 handler 本身，避免慢 handler 连带卡住并发的 NotifyReturn 调用。
 func (publisher *Publisher) invokeReturnHandler(r Return) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			publisher.options.Logger.Errorf("panic in return handler: %v", rec)
 		}
 	}()
-	publisher.notifyReturnHandler(r)
+	publisher.handlerMu.Lock()
+	handler := publisher.notifyReturnHandler
+	publisher.handlerMu.Unlock()
+	if handler != nil {
+		handler(r)
+	}
 }
 
 // startPublishHandler 开启确认模式并启动确认事件处理 goroutine。
@@ -463,16 +516,47 @@ func (publisher *Publisher) invokeReturnHandler(r Return) {
 // 意味着一旦 maxConcurrentHandlers 个 handler 同时卡住，第 101 个事件
 // 的转手会被 `sem <- struct{}{}` 卡住——这是有意选择的、有界的背压，
 // 而不是完全消除慢 handler 的影响；handler 仍然应当尽量不阻塞。
+//
+// 去重：与 startReturnHandler 同样的问题和同样的修复——本方法可能被
+// NotifyPublish 和重连成功后的自动重启并发调用，用 publishHandlerGeneration
+// 配合 WithChannelForNewGeneration 的原子"判断代号 + 注册"，保证每一代通道
+// 最多只成功启动一次监听协程。
+//
+// ConfirmSafe 刻意放在 handlerMu 之外、且在原子注册之前：它取的是 channelMu
+// 写锁，绝不能在 WithChannelForNewGeneration 的读锁回调里调用（RWMutex 会
+// 自锁）。相应地，代号是在 ConfirmSafe 成功之后才被标记消耗的，所以这一代
+// 的 ConfirmSafe 失败不会把该代号"用掉"，下一次调用仍然会重试——比之前
+// 先标记再 ConfirmSafe 的写法更不容易静默丢失确认能力。
 func (publisher *Publisher) startPublishHandler() {
 	publisher.handlerMu.Lock()
-	if publisher.notifyPublishHandler == nil {
-		publisher.handlerMu.Unlock()
+	registered := publisher.notifyPublishHandler != nil
+	publisher.handlerMu.Unlock()
+	if !registered {
 		return
 	}
-	publisher.handlerMu.Unlock()
 
 	if err := publisher.chanManager.ConfirmSafe(false); err != nil {
 		publisher.options.Logger.Errorf("could not put channel in confirm mode: %v", err)
+		return
+	}
+
+	publisher.handlerMu.Lock()
+	defer publisher.handlerMu.Unlock()
+
+	// 上面短暂放开过 handlerMu，期间 handler 有可能被并发改动，重新确认一次。
+	if publisher.notifyPublishHandler == nil {
+		return
+	}
+
+	var confirmationCh chan amqp.Confirmation
+	publisher.chanManager.WithChannelForNewGeneration(func(ch *amqp.Channel, generation uint) {
+		if publisher.publishHandlerGeneration == int(generation) {
+			return // 这一代通道已经有监听协程了，不重复注册
+		}
+		publisher.publishHandlerGeneration = int(generation)
+		confirmationCh = ch.NotifyPublish(make(chan amqp.Confirmation, 100))
+	})
+	if confirmationCh == nil {
 		return
 	}
 
@@ -480,7 +564,6 @@ func (publisher *Publisher) startPublishHandler() {
 		const maxConcurrentHandlers = 100
 		sem := make(chan struct{}, maxConcurrentHandlers)
 
-		confirmationCh := publisher.chanManager.NotifyPublishSafe(make(chan amqp.Confirmation, 100))
 		for conf := range confirmationCh {
 			sem <- struct{}{}
 			go func(c amqp.Confirmation) {
@@ -492,13 +575,21 @@ func (publisher *Publisher) startPublishHandler() {
 }
 
 // invokePublishHandler 执行发布确认处理函数，通过 recover 保护防止 panic 影响整体。
+//
+// 加锁读取 notifyPublishHandler 的理由同 invokeReturnHandler。
 func (publisher *Publisher) invokePublishHandler(c amqp.Confirmation) {
 	defer func() {
 		if r := recover(); r != nil {
 			publisher.options.Logger.Errorf("panic in publish handler: %v", r)
 		}
 	}()
-	publisher.notifyPublishHandler(Confirmation{
+	publisher.handlerMu.Lock()
+	handler := publisher.notifyPublishHandler
+	publisher.handlerMu.Unlock()
+	if handler == nil {
+		return
+	}
+	handler(Confirmation{
 		Confirmation:      c,
 		ReconnectionCount: int(publisher.chanManager.ReconnectionCount()),
 	})

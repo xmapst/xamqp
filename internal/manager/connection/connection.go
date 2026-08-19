@@ -26,15 +26,32 @@ import (
 //   - readUniversalBlockReceiver 将信号广播给所有已注册的 Publisher
 //   - 避免多个 Publisher 各自注册 NotifyBlocked 导致的信号丢失问题
 //   - 连接重连后会在新连接上重新注册，避免通知永久失效
+//
+// 重连策略（amqp091-go >= v1.13.0 原生恢复 + xamqp 自己的兜底重连两层）：
+//   - New() 会为每个连接自动填充 amqp.Config.Recovery（除非调用方已经通过
+//     WithConnectionOptionsConfig 显式设置），默认启用底层库的原生自动恢复：
+//     TCP 重连、exchange/queue/binding 拓扑、消费者订阅全部原地在同一个
+//     *amqp.Connection 指针上透明重建，已注册的 NotifyBlocked/NotifyStateChange
+//     等监听者随之保留，不丢失、不需要重新注册。
+//   - startNotifyClose 统一通过 NotifyStateChange 监听：中间态
+//     （StateReconnecting/StateOpen）只记录日志；只有终态 StateClosed 且
+//     Err != nil（原生恢复重试耗尽或遇到不可恢复错误，比如认证失败，
+//     或者干脆没有配置有效的 Recovery）才说明这个连接对象已经报废——
+//     amqp091-go 自身此后不会再做任何事（closeResources 会把
+//     noNotify 置为 true、清空 channels/allocator，watchConnection 的
+//     监听协程也随着 NotifyClose 通道被关闭而退出），此时才触发 xamqp
+//     自己的 dial() 全新连接兜底流程，保证连接会一直重试下去，不会像
+//     只靠原生恢复那样在重试耗尽后永久停摆。StateClosed 且 Err == nil
+//     对应用户主动 Close()，仅记录日志。
 type Manager struct {
 	logger              logger.ILogger   // 日志实现
-	resolver            IResolver        // 连接地址解析器
+	url                 string           // 连接地址，创建后不再变更
 	connection          *amqp.Connection // AMQP 连接，受 connectionMu 保护
 	amqpConfig          amqp.Config      // 建立连接时使用的协商参数，创建后不再变更
 	connectionMu        *sync.RWMutex    // 读写锁：保护 connection/closed 字段
 	closed              bool             // 是否已调用 Close，受 connectionMu 保护，防止与在途重连竞争
 	closeSignal         chan struct{}    // Close() 时关闭，用于立刻打断正在等待退避的 reconnectLoop
-	ReconnectInterval   time.Duration    // 首次重连等待时间（指数退避的基础值）
+	ReconnectInterval   time.Duration    // 首次重连等待时间（指数退避的基础值），同时也是原生恢复重试间隔的默认来源
 	reconnectionCount   uint             // 累计重连次数
 	reconnectionCountMu *sync.Mutex      // 单独保护重连计数，避免与 connectionMu 产生锁竞争
 
@@ -50,38 +67,48 @@ type Manager struct {
 // errClosed 表示连接管理器已被 Close，重连循环应立即停止，不再创建新连接。
 var errClosed = errors.New("connection manager is closed")
 
-// IResolver 连接地址解析器接口，支持自定义节点选择策略。
-type IResolver interface {
-	Resolve() ([]string, error)
+// defaultRecovery 构造 xamqp 默认使用的原生恢复配置。
+//
+// 只设置 ReconnectionConfig：RetryInterval 复用 xamqp 自己已有的
+// ReconnectInterval 配置项，让它同时控制原生恢复的重试节奏和（原生恢复
+// 放弃后）xamqp 自己兜底 reconnectLoop 的退避基础值，用户只需要调一个
+// 参数。MaxRetryCount 用 amqp091-go 自己的默认值（5）：原生恢复只会反复
+// 重试同一个 URL，重试次数不宜太大，否则会拖慢 xamqp 多节点故障转移的
+// 响应速度；ConnectionRecovery/TopologyRecovery/TopologyRecoveryMode
+// 留空，amqp091-go 在 DialConfig 内部会自动补上对应的默认实现
+// （DefaultConnectionRecovery/DefaultTopologyRecovery/全量拓扑恢复）。
+func defaultRecovery(reconnectInterval time.Duration) *amqp.Recovery {
+	return &amqp.Recovery{
+		ReconnectionConfig: &amqp.ReconnectionConfig{
+			MaxRetryCount: amqp.DefaultMaxRetryCount,
+			RetryInterval: reconnectInterval,
+		},
+	}
 }
 
-// dial 按顺序尝试连接所有地址，返回第一个成功的连接。
+// dial 连接到 amqp 服务器。
 //
-// 多地址支持集群高可用：若首选节点不可用，自动尝试备用节点。
 // 日志中的 URL 通过 maskPassword 脱敏，防止密码出现在日志文件中。
+// 不做多节点轮询：生产环境的 RabbitMQ 集群通常在前面有负载均衡（HAProxy、
+// LVS、云厂商 LB 等），对外只暴露一个入口地址，节点故障转移由负载均衡层
+// 负责，xamqp 自己不需要、也不应该重新实现一遍地址选择策略。
 func (m *Manager) dial() (*amqp.Connection, error) {
-	urls, err := m.resolver.Resolve()
+	conn, err := amqp.DialConfig(m.url, m.amqpConfig)
 	if err != nil {
-		return nil, fmt.Errorf("error resolving amqp server urls: %w", err)
+		return nil, fmt.Errorf("error connecting to amqp server %s: %w", m.maskPassword(m.url), err)
 	}
-
-	var errs []error
-	for _, _url := range urls {
-		conn, err := amqp.DialConfig(_url, m.amqpConfig)
-		if err == nil {
-			return conn, err
-		}
-		m.logger.Warnf("failed to connect to amqp server %s: %v", m.maskPassword(_url), err)
-		errs = append(errs, err)
-	}
-	return nil, errors.Join(errs...) // 汇总所有节点的连接错误
+	return conn, nil
 }
 
 // New 创建连接管理器，建立初始连接并启动连接异常监听和阻塞信号读取。
-func New(resolver IResolver, conf amqp.Config, log logger.ILogger, reconnectInterval time.Duration) (*Manager, error) {
+func New(url string, conf amqp.Config, log logger.ILogger, reconnectInterval time.Duration) (*Manager, error) {
+	if conf.Recovery == nil {
+		conf.Recovery = defaultRecovery(reconnectInterval)
+	}
+
 	connManager := Manager{
 		logger:                             log,
-		resolver:                           resolver,
+		url:                                url,
 		amqpConfig:                         conf,
 		connectionMu:                       &sync.RWMutex{},
 		closeSignal:                        make(chan struct{}),
@@ -139,22 +166,47 @@ func (m *Manager) WithConnection(fn func(*amqp.Connection) error) error {
 	return fn(m.connection)
 }
 
-// startNotifyClose 监听连接关闭事件，异常关闭时触发重连流程。
+// startNotifyClose 通过 NotifyStateChange 监听连接的生命周期变化，
+// 原生恢复放弃时触发 xamqp 自己的兜底重连流程。
 //
-// 正常关闭（Close() 调用）收到 nil 错误，仅记录日志。
-// 异常关闭（网络断开、服务器重启等）收到非 nil 错误，触发指数退避重连。
+// amqp091-go 的原生恢复会原地复用同一个 *amqp.Connection：TCP 重连、
+// exchange/queue/binding 拓扑、消费者订阅全部由库自身透明重建，期间该
+// 连接对象上已注册的 NotifyBlocked 等监听者无需重新注册（resetState 不会
+// 清空这些监听者列表），所以中间态（StateReconnecting/StateOpen）xamqp
+// 不需要做任何事——下游 Publisher/Consumer 看到的始终是同一个连接对象，
+// 不存在需要"重新初始化"的东西。
+//
+// 只有终态 StateClosed 且 Err != nil（原生恢复重试耗尽、遇到不可恢复
+// 错误，或者这次连接根本没有有效的 Recovery 配置）才说明这个连接对象
+// 已经报废，此时才兜底走 xamqp 自己的 dial() 全新连接流程。
+// 优雅关闭（用户调用 Close()）对应 StateClosed 且 Err == nil，仅记录日志。
 func (m *Manager) startNotifyClose() {
-	notifyCloseChan := m.connection.NotifyClose(make(chan *amqp.Error, 1))
+	stateCh := make(chan *amqp.StateChanged, 1)
+	m.connection.NotifyStateChange(stateCh)
+	m.handleStateChanges(stateCh)
+}
 
-	err := <-notifyCloseChan
-	if err != nil {
-		m.logger.Errorf("attempting to reconnect to amqp server after connection close with error: %v", err)
-		m.reconnectLoop()
-		m.logger.Warnf("successfully reconnected to amqp server")
-		_ = m.dispatcher.Dispatch(err)
-	}
-	if err == nil {
-		m.logger.Infof("amqp connection closed gracefully")
+// handleStateChanges 是 startNotifyClose 的事件循环部分，独立拆出便于
+// 在没有真实 broker 的环境下用手动驱动的 channel 单元测试其分支逻辑。
+func (m *Manager) handleStateChanges(stateCh <-chan *amqp.StateChanged) {
+	for sc := range stateCh {
+		switch sc.To {
+		case amqp.StateReconnecting:
+			m.logger.Warnf("amqp connection lost, native recovery in progress")
+		case amqp.StateOpen:
+			m.logger.Infof("amqp connection recovered by native recovery")
+		case amqp.StateClosed:
+			if sc.Err != nil {
+				m.logger.Errorf("native recovery exhausted, falling back to full reconnect: %v", sc.Err)
+				m.reconnectLoop()
+				m.logger.Warnf("successfully reconnected to amqp server")
+				_ = m.dispatcher.Dispatch(sc.Err)
+			} else {
+				m.logger.Infof("amqp connection closed gracefully")
+			}
+			return
+		default:
+		}
 	}
 }
 
@@ -206,7 +258,7 @@ func (m *Manager) reconnectLoop() {
 
 // reconnect 建立新连接后，仅在写锁保护下做指针替换，避免长时间持锁做网络 I/O。
 //
-// 拨号（可能重试多个集群节点，耗时较长）在锁外完成，
+// 拨号（网络 I/O，耗时较长）在锁外完成，
 // 只有安装新连接、关闭旧连接前的状态检查才需要写锁；
 // 若此时管理器已被 Close，则丢弃刚建立的新连接并返回 errClosed，
 // 防止 Close 与重连竞争产生一个再也没有人引用、也没有人能关闭的孤立连接。

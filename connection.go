@@ -1,8 +1,6 @@
 package xamqp
 
 import (
-	"math/rand/v2"
-	"slices"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -29,44 +27,13 @@ type Conn struct {
 // 通过 DialConfig 或 Open 方法传递给 RabbitMQ 服务器。
 type Config amqp.Config
 
-// IResolver 连接地址解析器接口，允许自定义连接目标的选择策略。
-type IResolver = connection.IResolver
-
-// StaticResolver 静态地址列表解析器，支持固定地址集合和随机打乱顺序。
+// NewConn 使用给定地址创建 RabbitMQ 连接管理器。
 //
-// shuffle=true 时每次解析随机打乱地址顺序，
-// 实现简单的客户端负载均衡（每次连接随机选择不同节点）。
-type StaticResolver struct {
-	urls    []string // 固定的候选地址列表
-	shuffle bool     // 是否在每次 Resolve() 时随机打乱地址顺序
-}
-
-// Resolve 返回可用的连接地址列表，shuffle=true 时随机打乱顺序。
-func (r *StaticResolver) Resolve() ([]string, error) {
-	var urls = slices.Clone(r.urls) // 拷贝避免修改原切片
-	if r.shuffle {
-		rand.Shuffle(len(urls), func(i, j int) {
-			urls[i], urls[j] = urls[j], urls[i]
-		})
-	}
-	return urls, nil
-}
-
-// NewStaticResolver 创建静态地址解析器。
-func NewStaticResolver(urls []string, shuffle bool) *StaticResolver {
-	return &StaticResolver{urls: urls, shuffle: shuffle}
-}
-
-// NewConn 使用单个 URL 创建 RabbitMQ 连接管理器。
-func NewConn(url string, opts ...func(*ConnectionOptions)) (*Conn, error) {
-	return NewClusterConn(NewStaticResolver([]string{url}, false), opts...)
-}
-
-// NewClusterConn 使用自定义地址解析器创建 RabbitMQ 集群连接管理器。
-//
-// 支持连接到 RabbitMQ 集群的多个节点，通过 IResolver 实现节点选择策略（轮询、随机等）。
+// 只接受单个地址：生产环境的 RabbitMQ 集群通常在前面有负载均衡（HAProxy、
+// LVS、云厂商 LB 等），对外只暴露一个入口地址，节点故障转移由负载均衡层
+// 负责，无需 xamqp 自己实现多节点选择/轮询。
 // 后台 goroutine 监听重连事件并记录日志，调用方无感知自动恢复。
-func NewClusterConn(resolver IResolver, opts ...func(*ConnectionOptions)) (*Conn, error) {
+func NewConn(url string, opts ...func(*ConnectionOptions)) (*Conn, error) {
 	options := new(getDefaultConnectionOptions())
 	for _, optFn := range opts {
 		optFn(options)
@@ -76,7 +43,7 @@ func NewClusterConn(resolver IResolver, opts ...func(*ConnectionOptions)) (*Conn
 		options: *options,
 	}
 	var err error
-	conn.connManager, err = connection.New(resolver, amqp.Config(options.Config), options.Logger, options.ReconnectInterval)
+	conn.connManager, err = connection.New(url, amqp.Config(options.Config), options.Logger, options.ReconnectInterval)
 	if err != nil {
 		return nil, err
 	}

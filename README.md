@@ -50,22 +50,21 @@
 
 ### 1. 自动重连
 
-[`Conn`](connection.go:16) 基于内部连接管理器封装了 RabbitMQ 连接生命周期；[`Consumer`](consume.go:40)、[`Publisher`](publish.go:64)、[`Channel`](channel.go:14) 基于通道管理器继续实现通道级恢复。当连接或通道异常关闭时，库会自动进行带抖动的指数退避重连。
+[`Conn`](connection.go:15) 基于内部连接管理器封装了 RabbitMQ 连接生命周期；[`Consumer`](consume.go:40)、[`Publisher`](publish.go:64)、[`Channel`](channel.go:14) 基于通道管理器继续实现通道级恢复。恢复分两层：默认优先使用 amqp091-go 原生自动恢复，原生恢复耗尽或遇到不可恢复错误后，再由 xamqp 自己带抖动的指数退避重连兜底（详见[自动重连机制](#自动重连机制)）。
 
-- 初始退避由 [`ConnectionOptions.ReconnectInterval`](connection_options.go:9) 控制
-- 失败后按指数退避增长，封顶 16 倍初始值，并叠加最多 25% 的随机抖动，避免同一 Broker 下的大量客户端在网络恢复后集中在同一时刻重连（惊群效应），见 [`internal/backoff.Delay()`](internal/backoff/backoff.go:16)
-- 调用 `Close()` 会立刻打断正在等待退避的重连协程，不需要等满一个退避周期，见 [`reconnectLoop()`](internal/manager/connection/connection.go:170) 与 [`reconnectLoop()`](internal/manager/channel/channel.go:130)
+- 初始退避由 [`ConnectionOptions.ReconnectInterval`](connection_options.go:9) 控制，同时也是原生恢复重试间隔的默认来源
+- 失败后按指数退避增长，封顶 16 倍初始值，并叠加最多 25% 的随机抖动，避免同一 Broker 下的大量客户端在网络恢复后集中在同一时刻重连（惊群效应），见 [`internal/backoff.Delay()`](internal/backoff/backoff.go:18)
+- 调用 `Close()` 会立刻打断正在等待退避的重连协程，不需要等满一个退避周期，见 [`reconnectLoop()`](internal/manager/connection/connection.go:229) 与 [`reconnectLoop()`](internal/manager/channel/channel.go:169)
 
 ### 2. 高层抽象
 
 仓库提供几个主要入口：
 
-- [`NewConn()`](connection.go:59)：创建单节点连接
-- [`NewClusterConn()`](connection.go:67)：创建集群连接，支持自定义解析器
+- [`NewConn()`](connection.go:36)：创建连接（只接受单个入口地址，多节点故障转移交给前置负载均衡）
 - [`NewDeclarator()`](declare.go:19)：统一声明交换机、队列和绑定
 - [`NewConsumer()`](consume.go:61)：创建自动恢复的消费者
-- [`NewPublisher()`](publish.go:80)：创建自动恢复的发布者
-- [`NewChannel()`](channel.go:22)：暴露底层 AMQP 通道能力
+- [`NewPublisher()`](publish.go:97)：创建自动恢复的发布者
+- [`NewChannel()`](channel.go:23)：暴露底层 AMQP 通道能力
 
 ### 3. 面向生产环境的行为细节
 
@@ -85,7 +84,8 @@
 要求：
 
 - Go 版本：项目当前声明为 [`go 1.26.3`](go.mod:3)
-- RabbitMQ Go 客户端依赖：[`github.com/rabbitmq/amqp091-go`](go.mod:5)
+- RabbitMQ Go 客户端依赖：[`github.com/rabbitmq/amqp091-go`](go.mod:5)（仓库当前锁定 v1.14.0）
+- 原生自动恢复（见[自动重连机制](#自动重连机制)）要求 amqp091-go >= v1.13.0，仓库当前锁定版本已满足
 
 安装命令：
 
@@ -105,23 +105,21 @@ go get github.com/xmapst/xamqp
 4. 发布确认、退回消息、流控处理通常需要额外样板代码。
 5. 多个模块共享同一连接时，重连与阻塞通知管理容易复杂化。
 
-该仓库通过内部 [`connection.Manager`](internal/manager/connection/connection.go:27)、[`channel.Manager`](internal/manager/channel/channel.go:25) 和 [`dispatcher.Dispatcher`](internal/dispatcher/dispatcher.go:17) 完成连接恢复与事件广播，使上层 API 保持相对简洁。
+该仓库通过内部 [`connection.Manager`](internal/manager/connection/connection.go:46)、[`channel.Manager`](internal/manager/channel/channel.go:28) 和 [`dispatcher.Dispatcher`](internal/dispatcher/dispatcher.go:17) 完成连接恢复与事件广播，使上层 API 保持相对简洁。
 
 ---
 
 ## 核心组件
 
-### [`Conn`](connection.go:16)
+### [`Conn`](connection.go:15)
 
 用于管理与 RabbitMQ 的连接，可在多个发布者和消费者之间共享。
 
 能力：
 
-- 支持单节点或集群连接
-- 支持自定义地址解析器 [`IResolver`](connection.go:31)
-- 支持静态地址列表解析器 [`StaticResolver`](connection.go:37)
+- 单一入口地址连接；生产环境的集群高可用/故障转移由前置负载均衡（HAProxy、LVS、云厂商 LB 等）负责，xamqp 不内置多节点选择/轮询逻辑
 - 支持连接参数透传 [`Config`](connection.go:28)
-- 自动处理断线重连
+- 自动处理断线重连（原生恢复 + xamqp 兜底重连两层，见[自动重连机制](#自动重连机制)）
 
 ### [`Declarator`](declare.go:14)
 
@@ -200,19 +198,7 @@ func main() {
 }
 ```
 
-若是 RabbitMQ 集群，可使用 [`NewClusterConn()`](connection.go:67)：
-
-```go
-resolver := xamqp.NewStaticResolver([]string{
-    "amqp://guest:guest@node1:5672/",
-    "amqp://guest:guest@node2:5672/",
-    "amqp://guest:guest@node3:5672/",
-}, true)
-
-conn, err := xamqp.NewClusterConn(resolver)
-```
-
-其中 [`NewStaticResolver()`](connection.go:54) 的第二个参数 `shuffle=true` 表示每次解析时打乱节点顺序，可用于简单的客户端侧负载分散。
+`NewConn()` 只接受单个 URL。生产环境的 RabbitMQ 集群通常在前面有负载均衡（HAProxy、LVS、云厂商 LB 等），对外只暴露一个入口地址，节点故障转移由负载均衡层负责，xamqp 不提供自己的多节点选择/轮询逻辑。
 
 ### 2. 声明交换机、队列与绑定
 
@@ -414,38 +400,20 @@ for _, conf := range confs {
 
 主要入口：
 
-- [`NewConn()`](connection.go:59)
-- [`NewClusterConn()`](connection.go:67)
-- [`NewStaticResolver()`](connection.go:54)
-- [`Close()`](connection.go:99)
-- [`IsClosed()`](connection.go:105)
+- [`NewConn()`](connection.go:36)
+- [`Close()`](connection.go:72)
+- [`IsClosed()`](connection.go:82)
 
 说明：
 
-- [`NewConn()`](connection.go:59) 适合单个 RabbitMQ 节点地址。
-- [`NewClusterConn()`](connection.go:67) 支持传入自定义 [`IResolver`](connection.go:31)，可以自行实现轮询、随机、权重、服务发现等策略。
-- [`Config`](connection.go:28) 是对 `amqp.Config` 的别名封装，可传入心跳、最大通道数、帧大小等连接协商参数。
-
-### 示例：自定义解析器
-
-```go
-type MyResolver struct{}
-
-func (r *MyResolver) Resolve() ([]string, error) {
-    return []string{
-        "amqp://guest:guest@mq-1:5672/",
-        "amqp://guest:guest@mq-2:5672/",
-    }, nil
-}
-```
-
-将其传给 [`NewClusterConn()`](connection.go:67) 即可。
+- [`NewConn()`](connection.go:36) 只接受单个 URL；生产环境的 RabbitMQ 集群高可用/故障转移应由前置负载均衡（HAProxy、LVS、云厂商 LB 等）负责，xamqp 不内置多节点选择/轮询逻辑。
+- [`Config`](connection.go:28) 是对 `amqp.Config` 的别名封装，可传入心跳、最大通道数、帧大小、`Recovery` 等连接协商参数。
 
 ---
 
 ## 底层通道 `Channel`
 
-入口：[`NewChannel()`](channel.go:22)
+入口：[`NewChannel()`](channel.go:23)
 
 适用场景：
 
@@ -453,7 +421,7 @@ func (r *MyResolver) Resolve() ([]string, error) {
 - 你不希望使用高层 `Publisher` / `Consumer` 抽象
 - 你需要自定义更底层的 AMQP 操作
 
-创建时会先应用 [`ChannelOptions.QOSPrefetch`](channel_options.go:6) 与 [`ChannelOptions.QOSGlobal`](channel_options.go:7)；若同时设置了 [`ChannelOptions.ConfirmMode`](channel_options.go:8)（通过 [`WithChannelOptionsConfirm()`](channel_options.go:54)），也会一并让通道进入发布确认模式。QoS 或确认模式任一步设置失败都会直接关闭通道并返回错误，避免通道带着错误配置继续被使用，见 [`NewChannel()`](channel.go:22)。
+创建时会先应用 [`ChannelOptions.QOSPrefetch`](channel_options.go:6) 与 [`ChannelOptions.QOSGlobal`](channel_options.go:7)；若同时设置了 [`ChannelOptions.ConfirmMode`](channel_options.go:8)（通过 [`WithChannelOptionsConfirm()`](channel_options.go:54)），也会一并让通道进入发布确认模式。QoS 或确认模式任一步设置失败都会直接关闭通道并返回错误，避免通道带着错误配置继续被使用，见 [`NewChannel()`](channel.go:23)。
 
 ---
 
@@ -612,7 +580,7 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 - [`WithChannelOptionsLogger()`](channel_options.go:44)
 - [`WithChannelOptionsConfirm()`](channel_options.go:54)
 
-说明：[`ChannelOptions.ConfirmMode`](channel_options.go:8) 会在 [`NewChannel()`](channel.go:22) 中实际启用确认模式（失败则创建返回错误）；但 `Channel` 是底层原语封装，不像 `Publisher` 那样在重连后自动重新声明拓扑、重新注册确认回调，多数场景仍建议优先使用 [`Publisher`](publish.go:64)。
+说明：[`ChannelOptions.ConfirmMode`](channel_options.go:8) 会在 [`NewChannel()`](channel.go:23) 中实际启用确认模式（失败则创建返回错误）；但 `Channel` 是底层原语封装，不像 `Publisher` 那样在重连后自动重新声明拓扑、重新注册确认回调，多数场景仍建议优先使用 [`Publisher`](publish.go:64)。
 
 ---
 
@@ -782,22 +750,25 @@ func(d xamqp.Delivery) xamqp.Action
 
 ## 自动重连机制
 
-连接恢复链路：
+连接与通道的恢复现在分两层：**默认优先走 amqp091-go 原生自动恢复（快速路径），原生恢复重试耗尽或遇到不可恢复错误后，再由 xamqp 自己的退避重连兜底**。这个行为开箱即用，不需要任何代码改动；进阶用户可通过 [`WithConnectionOptionsConfig()`](connection_options.go:47) 自行设置 `Config.Recovery` 覆盖重试参数。原生恢复要求 amqp091-go >= v1.13.0（见[安装](#安装)）。
 
-- [`Conn`](connection.go:16) 持有内部 [`connection.Manager`](internal/manager/connection/connection.go:27)
-- 连接异常关闭后，由 [`startNotifyClose()`](internal/manager/connection/connection.go:133) 触发重连
-- 重连成功后，通过 [`dispatcher.Dispatcher`](internal/dispatcher/dispatcher.go:17) 向订阅者广播恢复事件
-- 上层 [`Publisher`](publish.go:51)、[`Consumer`](consume.go:40) 和其他通道组件收到事件后重新初始化自身状态
+### 快速路径：原生恢复
 
-通道恢复链路：
+- [`connection.Manager.New()`](internal/manager/connection/connection.go:104) 在调用方未通过 `WithConnectionOptionsConfig` 显式设置 `Config.Recovery` 时，会自动填充默认值 [`defaultRecovery()`](internal/manager/connection/connection.go:80)：`ReconnectionConfig{MaxRetryCount: amqp.DefaultMaxRetryCount, RetryInterval: <ConnectionOptions.ReconnectInterval>}`
+- 启用后，TCP 重连、交换机/队列/绑定拓扑、消费者订阅全部由 amqp091-go 在同一个 `*amqp.Connection` / `*amqp.Channel` 指针上原地透明重建；已注册的 `NotifyBlocked` 等监听者不丢失、无需重新注册，也不涉及 xamqp 自己的指针替换或 dispatcher 广播
+- 中间态通过 `NotifyStateChange` 观察：`StateReconnecting` / `StateOpen` 只记录日志，不会触发 xamqp 自己的任何重建逻辑，见 [`handleStateChanges()`](internal/manager/connection/connection.go:191)（连接）与 [`handleCancelOrStateChange()`](internal/manager/channel/channel.go:111)（通道）
 
-- [`channel.Manager`](internal/manager/channel/channel.go:25) 监听 `NotifyClose` / `NotifyCancel`
-- 通道异常后触发内部重建
-- 恢复成功后广播给通道使用者
+### 兜底路径：xamqp 自己的重连
+
+- 只有当 `NotifyStateChange` 到达终态 `StateClosed` 且带非空错误（原生恢复重试耗尽、遇到认证失败等不可恢复错误，或本来就没有配置有效的 `Recovery`）时，才会触发 xamqp 自己的 [`reconnectLoop()`](internal/manager/connection/connection.go:229)（连接）与 [`reconnectLoop()`](internal/manager/channel/channel.go:169)（通道）
+- 二者都使用带抖动的指数退避（见 [`internal/backoff.Delay()`](internal/backoff/backoff.go:18)），并且会一直重试下去，不会像原生恢复那样在达到 `MaxRetryCount` 后放弃——这保留了 xamqp 最初“无限重试”的保证
+- 重建成功后，通过 [`dispatcher.Dispatcher`](internal/dispatcher/dispatcher.go:17) 向订阅者广播恢复事件，上层 [`Publisher`](publish.go:64)、[`Consumer`](consume.go:40) 收到事件后重新初始化自身状态（重新声明拓扑、重新订阅、重新进入 confirm 模式等）
+- `basic.cancel`（例如队列被外部删除）不受原生恢复处理，通道层始终由 xamqp 自己的 `NotifyCancel` 分支触发重建，见 [`handleCancelOrStateChange()`](internal/manager/channel/channel.go:111)
+- 调用 `Close()` 会立刻打断正在等待退避的重连协程，不需要等满一个退避周期
 
 这意味着：
 
-- 连接断了时，无需业务手动重建 `Publisher` / `Consumer`
+- 连接/通道断了时，无需业务手动重建 `Publisher` / `Consumer`
 - 但业务仍应正确处理“当前一次操作失败”的错误返回
 - 自动恢复并不等于操作幂等，消息去重仍应由业务设计保证
 
@@ -873,7 +844,6 @@ gorabbit WARN: pausing publishing due to flow request from server
 - [`examples/multiconsumer`](examples/multiconsumer/main.go)：同一个 `Conn` 下运行多个独立 `Consumer`
 - [`examples/multipublisher`](examples/multipublisher/main.go)：定时发布循环，配合信号实现优雅关闭
 - [`examples/logger`](examples/logger/main.go)：实现自定义 `ILogger` 并注入
-- [`examples/cluster`](examples/cluster/main.go)：`NewClusterConn` 与自定义 `IResolver`
 
 运行前需要一个可访问的 RabbitMQ 实例（默认 `amqp://guest:guest@127.0.0.1:5672/`）。
 

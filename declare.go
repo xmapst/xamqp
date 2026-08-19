@@ -12,7 +12,7 @@ import (
 // 适合在应用启动时统一完成 AMQP 拓扑的初始化，
 // 避免每个 Publisher/Consumer 都重复执行声明逻辑。
 type Declarator struct {
-	chanManager *channel.Manager
+	chanManager *channel.Manager // 独立的通道管理器，专用于声明操作
 }
 
 // NewDeclarator 创建资源声明器，使用独立的 AMQP 通道。

@@ -93,28 +93,28 @@ type RabbitConsumerOptions struct {
 // Passive=true 时假定队列已存在，若不存在则 RabbitMQ 返回异常；
 // Passive=false 时若队列不存在则自动创建。
 type QueueOptions struct {
+	Args       amqp.Table // 额外参数（如 x-message-ttl、x-dead-letter-exchange 等）
 	Name       string     // 队列名称
 	Durable    bool       // 持久化：RabbitMQ 重启后队列依然存在
 	AutoDelete bool       // 自动删除：最后一个消费者断开后自动删除队列
 	Exclusive  bool       // 独占队列：只有创建它的连接可使用，连接关闭时自动删除
 	NoWait     bool       // 不等待服务器确认
 	Passive    bool       // 被动模式：若不存在则报错而非创建
-	Args       amqp.Table // 额外参数（如 x-message-ttl、x-dead-letter-exchange 等）
 	Declare    bool       // 是否在启动时声明
 }
 
 // Binding 描述队列到交换机的路由键绑定关系。
 type Binding struct {
-	Source      string // 源交换机名称
-	Destination string // 目标队列名称
-	RoutingKey  string // 路由键
-	BindingOptions
+	Source         string // 源交换机名称
+	Destination    string // 目标队列名称
+	RoutingKey     string // 路由键
+	BindingOptions        // 内嵌的绑定附加选项（NoWait/Args/Declare）
 }
 
 // BindingOptions 绑定配置选项。
 type BindingOptions struct {
-	NoWait  bool       // 不等待服务器确认
 	Args    amqp.Table // 额外参数
+	NoWait  bool       // 不等待服务器确认
 	Declare bool       // 是否在启动时声明此绑定
 }
 

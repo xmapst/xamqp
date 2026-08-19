@@ -3,6 +3,7 @@ package xamqp
 import (
 	"math/rand/v2"
 	"slices"
+	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -14,11 +15,12 @@ import (
 // 封装了底层连接管理器，自动处理断线重连，
 // 调用方无需感知连接中断，只需在使用 Publisher/Consumer 时处理具体操作的错误。
 type Conn struct {
-	connManager                *connection.Manager
-	reconnectErrCh             <-chan error
-	closeConnectionToManagerCh chan<- struct{}
+	connManager                *connection.Manager // 底层连接管理器，负责实际的连接建立/重连
+	reconnectErrCh             <-chan error        // 订阅自 connManager 的重连事件通道，仅用于记录恢复日志
+	closeConnectionToManagerCh chan<- struct{}     // 取消订阅信号：Close() 时写入，通知 connManager 停止推送重连事件
+	closeOnce                  sync.Once           // 保证 Close() 幂等，避免重复调用时永久阻塞
 
-	options ConnectionOptions
+	options ConnectionOptions // 创建时传入的连接选项快照
 }
 
 // Config 封装 amqp.Config，用于连接建立时协商连接参数。
@@ -35,8 +37,8 @@ type IResolver = connection.IResolver
 // shuffle=true 时每次解析随机打乱地址顺序，
 // 实现简单的客户端负载均衡（每次连接随机选择不同节点）。
 type StaticResolver struct {
-	urls    []string
-	shuffle bool
+	urls    []string // 固定的候选地址列表
+	shuffle bool     // 是否在每次 Resolve() 时随机打乱地址顺序
 }
 
 // Resolve 返回可用的连接地址列表，shuffle=true 时随机打乱顺序。
@@ -96,9 +98,17 @@ func (conn *Conn) handleRestarts() {
 // 关闭前应先关闭所有基于此连接创建的 Consumer 和 Publisher，
 // 否则可能导致这些组件的操作返回意外错误。
 // 关闭后此 Conn 实例不可复用。
+//
+// 幂等：重复调用是安全的，第二次及以后的调用直接返回 nil。
+// 若不做此保护，向 closeConnectionToManagerCh 的同步发送在第二次调用时
+// 将没有接收者（dispatcher 的清理协程只接收一次），调用方会永久阻塞。
 func (conn *Conn) Close() error {
-	conn.closeConnectionToManagerCh <- struct{}{}
-	return conn.connManager.Close()
+	var err error
+	conn.closeOnce.Do(func() {
+		conn.closeConnectionToManagerCh <- struct{}{}
+		err = conn.connManager.Close()
+	})
+	return err
 }
 
 // IsClosed 返回连接是否已关闭。

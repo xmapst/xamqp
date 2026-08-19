@@ -18,20 +18,24 @@ import (
 // 每个 Publisher/Consumer 持有独立的通道，通道异常不影响其他通道。
 //
 // 并发安全：
-//   - channelMu RWMutex 保护 channel 字段的并发访问
+//   - channelMu RWMutex 保护 channel/closed 字段的并发访问
 //   - 读操作（Consume/Publish/Declare 等）持有读锁，允许并发
 //   - 写操作（reconnect/Close）持有写锁，独占访问
 //   - reconnectionCountMu 单独保护重连计数，避免与 channelMu 产生锁竞争
 type Manager struct {
-	logger              logger.ILogger
-	channel             *amqp.Channel // 底层 AMQP 通道，受 channelMu 保护
-	connManager         *connection.Manager
-	channelMu           *sync.RWMutex // 读写锁：允许多读单写
-	reconnectInterval   time.Duration
-	reconnectionCount   uint // 累计重连次数，用于确认消息的 ID 计算
-	reconnectionCountMu *sync.Mutex
+	logger              logger.ILogger         // 日志实现
+	channel             *amqp.Channel          // 底层 AMQP 通道，受 channelMu 保护
+	connManager         *connection.Manager    // 所属的连接管理器，重连时用于借用连接开新通道
+	channelMu           *sync.RWMutex          // 读写锁：允许多读单写
+	closed              bool                   // 是否已调用 Close，受 channelMu 保护，防止与在途重连竞争
+	reconnectInterval   time.Duration          // 首次重连等待时间（指数退避的基础值）
+	reconnectionCount   uint                   // 累计重连次数，用于确认消息的 ID 计算
+	reconnectionCountMu *sync.Mutex            // 单独保护重连计数，避免与 channelMu 产生锁竞争
 	dispatcher          *dispatcher.Dispatcher // 重连事件广播器
 }
+
+// errClosed 表示通道管理器已被 Close，重连循环应立即停止，不再创建新通道。
+var errClosed = errors.New("channel manager is closed")
 
 // New 创建通道管理器，初始化时立即建立 AMQP 通道并启动异常监听。
 func New(connManager *connection.Manager, log logger.ILogger, reconnectInterval time.Duration) (*Manager, error) {
@@ -56,13 +60,13 @@ func New(connManager *connection.Manager, log logger.ILogger, reconnectInterval 
 }
 
 // getNewChannel 从连接管理器借用连接并开启新通道。
-//
-// 使用 Checkout/Checkin 模式访问连接，通过引用计数防止连接在使用中被关闭。
 func (m *Manager) getNewChannel() (*amqp.Channel, error) {
-	conn := m.connManager.CheckoutConnection()
-	defer m.connManager.CheckinConnection()
-
-	ch, err := conn.Channel()
+	var ch *amqp.Channel
+	err := m.connManager.WithConnection(func(conn *amqp.Connection) error {
+		var err error
+		ch, err = conn.Channel()
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +123,7 @@ func (m *Manager) incrementReconnectionCount() {
 	m.reconnectionCount++
 }
 
-// reconnectLoop 持续尝试重建通道，使用指数退避策略（最大等待 60 秒）。
+// reconnectLoop 持续尝试重建通道，使用指数退避策略（最大等待 60 秒），直到成功或管理器被关闭。
 //
 // 指数退避的意义：避免在服务器故障期间因频繁重试加剧服务器负载，
 // 同时通过设置上限（60s）保证最终能在合理时间内重连。
@@ -132,6 +136,10 @@ func (m *Manager) reconnectLoop() {
 		time.Sleep(backoff)
 		err := m.reconnect()
 		if err != nil {
+			if errors.Is(err, errClosed) {
+				m.logger.Infof("channel manager closed, stopping reconnect loop")
+				return
+			}
 			m.logger.Errorf("error reconnecting to amqp server: %v", err)
 			backoff *= 2 // 指数退避：每次失败后等待时间翻倍
 			if backoff > maxBackoff {
@@ -145,35 +153,52 @@ func (m *Manager) reconnectLoop() {
 	}
 }
 
-// reconnect 在写锁保护下安全替换底层 AMQP 通道。
+// reconnect 建立新通道后，仅在写锁保护下做指针替换，避免长时间持锁做网络 I/O（开通道 RPC）。
 //
-// 先获取新通道，再关闭旧通道，保证不会出现无通道可用的空窗期。
+// 若此时管理器已被 Close，则丢弃刚建立的新通道并返回 errClosed，
+// 防止 Close 与重连竞争产生一个再也没有人引用、也没有人能关闭的孤立通道。
 func (m *Manager) reconnect() error {
-	m.channelMu.Lock()
-	defer m.channelMu.Unlock()
-
 	newChannel, err := m.getNewChannel()
 	if err != nil {
 		return err
 	}
 
+	m.channelMu.Lock()
+	if m.closed {
+		m.channelMu.Unlock()
+		if cerr := newChannel.Close(); cerr != nil {
+			m.logger.Warnf("error closing redundant channel after manager was closed: %v", cerr)
+		}
+		return errClosed
+	}
+
+	oldChannel := m.channel
+	m.channel = newChannel
+	m.channelMu.Unlock()
+
 	// 先建立新通道，再关闭旧通道，防止期间有操作无通道可用
-	if m.channel != nil {
-		if err = m.channel.Close(); err != nil {
+	if oldChannel != nil {
+		if err = oldChannel.Close(); err != nil {
 			m.logger.Warnf("error closing channel while reconnecting: %v", err)
 		}
 	}
-
-	m.channel = newChannel
 	return nil
 }
 
 // Close 安全关闭 AMQP 通道，释放服务器端资源。
+//
+// 幂等：重复调用直接返回 nil。同时标记 closed，
+// 使任何在途的 reconnect() 在完成开通道 RPC 后能感知到关闭并放弃安装新通道。
 func (m *Manager) Close() error {
-	m.logger.Infof("closing channel manager...")
 	m.channelMu.Lock()
 	defer m.channelMu.Unlock()
 
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+
+	m.logger.Infof("closing channel manager...")
 	err := m.channel.Close()
 	if err != nil {
 		m.logger.Errorf("close err: %v", err)

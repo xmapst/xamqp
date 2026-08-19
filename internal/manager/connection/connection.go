@@ -16,7 +16,7 @@ import (
 // Manager 管理 RabbitMQ 连接的生命周期，实现连接断线自动重建。
 //
 // 并发安全设计：
-//   - connectionMu RWMutex：保护 connection 字段，允许多个通道并发读取同一连接
+//   - connectionMu RWMutex：保护 connection/closed 字段，允许多个通道并发读取同一连接
 //   - reconnectionCountMu Mutex：单独保护重连计数，与 connectionMu 解耦避免锁竞争
 //   - publisherNotifyBlockingReceiversMu：保护阻塞接收者列表的并发修改
 //
@@ -24,24 +24,29 @@ import (
 //   - universalNotifyBlockingReceiver 唯一接收底层连接的阻塞信号
 //   - readUniversalBlockReceiver 将信号广播给所有已注册的 Publisher
 //   - 避免多个 Publisher 各自注册 NotifyBlocked 导致的信号丢失问题
+//   - 连接重连后会在新连接上重新注册，避免通知永久失效
 type Manager struct {
-	logger              logger.ILogger
-	resolver            IResolver
+	logger              logger.ILogger   // 日志实现
+	resolver            IResolver        // 连接地址解析器
 	connection          *amqp.Connection // AMQP 连接，受 connectionMu 保护
-	amqpConfig          amqp.Config
-	connectionMu        *sync.RWMutex
-	ReconnectInterval   time.Duration // 首次重连等待时间（指数退避的基础值）
-	reconnectionCount   uint
-	reconnectionCountMu *sync.Mutex
+	amqpConfig          amqp.Config      // 建立连接时使用的协商参数，创建后不再变更
+	connectionMu        *sync.RWMutex    // 读写锁：保护 connection/closed 字段
+	closed              bool             // 是否已调用 Close，受 connectionMu 保护，防止与在途重连竞争
+	ReconnectInterval   time.Duration    // 首次重连等待时间（指数退避的基础值）
+	reconnectionCount   uint             // 累计重连次数
+	reconnectionCountMu *sync.Mutex      // 单独保护重连计数，避免与 connectionMu 产生锁竞争
 
 	dispatcher *dispatcher.Dispatcher // 重连事件广播器
 
 	// 单一接收者模式：只注册一个 NotifyBlocked 通道，避免多次注册
-	universalNotifyBlockingReceiver     chan amqp.Blocking
-	universalNotifyBlockingReceiverUsed bool
-	publisherNotifyBlockingReceiversMu  *sync.RWMutex
-	publisherNotifyBlockingReceivers    []chan amqp.Blocking // 所有 Publisher 的阻塞通知通道
+	universalNotifyBlockingReceiver     chan amqp.Blocking  // 唯一接收底层连接 TCP 阻塞信号的通道，重连后会被替换为新的
+	universalNotifyBlockingReceiverUsed bool                // 是否已有 Publisher 注册过阻塞通知，决定重连后是否需要重新注册
+	publisherNotifyBlockingReceiversMu  *sync.RWMutex       // 保护阻塞接收者列表的并发修改
+	publisherNotifyBlockingReceivers    []*blockingReceiver // 所有 Publisher 的阻塞通知通道（每个附带互斥锁，定义见 safe_wraps.go）
 }
+
+// errClosed 表示连接管理器已被 Close，重连循环应立即停止，不再创建新连接。
+var errClosed = errors.New("connection manager is closed")
 
 // IResolver 连接地址解析器接口，支持自定义节点选择策略。
 type IResolver interface {
@@ -89,22 +94,27 @@ func New(resolver IResolver, conf amqp.Config, log logger.ILogger, reconnectInte
 		return nil, err
 	}
 	connManager.connection = conn
-	go connManager.startNotifyClose()           // 监听连接关闭事件
-	go connManager.readUniversalBlockReceiver() // 广播 TCP 阻塞信号给所有 Publisher
+	go connManager.startNotifyClose()                                                      // 监听连接关闭事件
+	go connManager.readUniversalBlockReceiver(connManager.universalNotifyBlockingReceiver) // 广播 TCP 阻塞信号给所有 Publisher
 	return &connManager, nil
 }
 
 // Close 安全关闭 AMQP 连接，通知 RabbitMQ 服务器正常断开。
+//
+// 幂等：重复调用直接返回 nil。同时标记 closed，
+// 使任何在途的 reconnect() 在完成拨号后能感知到关闭并放弃安装新连接，
+// 避免 Close 与重连竞争导致产生一个再也无法关闭的孤立连接。
 func (m *Manager) Close() error {
-	m.logger.Infof("closing connection manager...")
 	m.connectionMu.Lock()
 	defer m.connectionMu.Unlock()
 
-	err := m.connection.Close()
-	if err != nil {
-		return err
+	if m.closed {
+		return nil
 	}
-	return nil
+	m.closed = true
+
+	m.logger.Infof("closing connection manager...")
+	return m.connection.Close()
 }
 
 // NotifyReconnect 订阅连接重建成功事件。
@@ -112,18 +122,16 @@ func (m *Manager) NotifyReconnect() (<-chan error, chan<- struct{}) {
 	return m.dispatcher.AddSubscriber()
 }
 
-// CheckoutConnection 借出连接用于创建通道，需配对调用 CheckinConnection。
+// WithConnection 在读锁保护下安全地将当前连接借给 fn 使用。
 //
-// 通过持有读锁防止借用期间连接被替换（重连时持写锁），
-// 保证在同一连接上创建的通道不会指向已关闭的连接。
-func (m *Manager) CheckoutConnection() *amqp.Connection {
+// 相比"借出/归还"两个方法配对调用的模式，
+// 此处将持锁范围收敛在一次函数调用内，调用方不可能忘记释放锁，
+// 也不会在 fn 提前返回或 panic 时永久占用读锁导致 reconnect()/Close() 死锁。
+func (m *Manager) WithConnection(fn func(*amqp.Connection) error) error {
 	m.connectionMu.RLock()
-	return m.connection
-}
+	defer m.connectionMu.RUnlock()
 
-// CheckinConnection 归还连接，释放 CheckoutConnection 持有的读锁。
-func (m *Manager) CheckinConnection() {
-	m.connectionMu.RUnlock()
+	return fn(m.connection)
 }
 
 // startNotifyClose 监听连接关闭事件，异常关闭时触发重连流程。
@@ -158,7 +166,7 @@ func (m *Manager) incrementReconnectionCount() {
 	m.reconnectionCount++
 }
 
-// reconnectLoop 持续重连直到成功，使用指数退避（上限 60 秒）。
+// reconnectLoop 持续重连直到成功或管理器被关闭，使用指数退避（上限 60 秒）。
 func (m *Manager) reconnectLoop() {
 	backoff := m.ReconnectInterval
 	const maxBackoff = time.Second * 60
@@ -168,6 +176,10 @@ func (m *Manager) reconnectLoop() {
 		time.Sleep(backoff)
 		err := m.reconnect()
 		if err != nil {
+			if errors.Is(err, errClosed) {
+				m.logger.Infof("connection manager closed, stopping reconnect loop")
+				return
+			}
 			m.logger.Errorf("error reconnecting to amqp server: %v", err)
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -181,33 +193,55 @@ func (m *Manager) reconnectLoop() {
 	}
 }
 
-// reconnect 在写锁保护下安全替换底层 AMQP 连接。
+// reconnect 建立新连接后，仅在写锁保护下做指针替换，避免长时间持锁做网络 I/O。
 //
-// 先建立新连接再关闭旧连接，保证不出现无连接可用的空窗期。
+// 拨号（可能重试多个集群节点，耗时较长）在锁外完成，
+// 只有安装新连接、关闭旧连接前的状态检查才需要写锁；
+// 若此时管理器已被 Close，则丢弃刚建立的新连接并返回 errClosed，
+// 防止 Close 与重连竞争产生一个再也没有人引用、也没有人能关闭的孤立连接。
 func (m *Manager) reconnect() error {
-	m.connectionMu.Lock()
-	defer m.connectionMu.Unlock()
-
 	conn, err := m.dial()
 	if err != nil {
 		return err
 	}
 
-	// 先建立新连接，再关闭旧连接
-	if err = m.connection.Close(); err != nil {
-		m.logger.Warnf("error closing connection while reconnecting: %v", err)
+	m.connectionMu.Lock()
+	if m.closed {
+		m.connectionMu.Unlock()
+		if cerr := conn.Close(); cerr != nil {
+			m.logger.Warnf("error closing redundant connection after manager was closed: %v", cerr)
+		}
+		return errClosed
 	}
 
+	oldConnection := m.connection
 	m.connection = conn
+
+	// 旧连接关闭时，amqp091-go 会关闭所有通过 NotifyBlocked 注册在其上的通道，
+	// 包括 universalNotifyBlockingReceiver，导致 readUniversalBlockReceiver 退出。
+	// 若此前已有 Publisher 注册过阻塞通知，需要在新连接上重新注册并重启广播协程，
+	// 否则 TCP 阻塞背压通知会在重连后永久失效。
+	if m.universalNotifyBlockingReceiverUsed {
+		newReceiver := make(chan amqp.Blocking)
+		m.universalNotifyBlockingReceiver = newReceiver
+		m.connection.NotifyBlocked(newReceiver)
+		go m.readUniversalBlockReceiver(newReceiver)
+	}
+	m.connectionMu.Unlock()
+
+	// 先建立并安装新连接，再关闭旧连接，保证不出现无连接可用的空窗期。
+	if err = oldConnection.Close(); err != nil {
+		m.logger.Warnf("error closing connection while reconnecting: %v", err)
+	}
 	return nil
 }
 
 // IsClosed 检查连接是否已关闭。
 func (m *Manager) IsClosed() bool {
-	m.connectionMu.Lock()
-	defer m.connectionMu.Unlock()
+	m.connectionMu.RLock()
+	defer m.connectionMu.RUnlock()
 
-	return m.connection.IsClosed()
+	return m.closed || m.connection.IsClosed()
 }
 
 // maskPassword 将 AMQP URL 中的密码替换为 "***"，用于安全日志输出。

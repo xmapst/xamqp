@@ -8,27 +8,22 @@ import (
 
 // PublishOptions 单次消息发布的配置选项，对应 AMQP Publishing 结构体的各字段。
 type PublishOptions struct {
-	Exchange string // 目标交换机名称
-
-	// Mandatory=true 时若消息无法路由到任何队列，服务器通过 basic.return 返回给发布者
-	Mandatory bool
-	// Immediate=true 时若消费者不可立即接收消息，服务器通过 basic.return 返回给发布者
-	// 注意：RabbitMQ 3.x 已废弃 Immediate 标志
-	Immediate bool
-
+	Timestamp       time.Time  // 消息创建时间戳
+	Headers         amqp.Table // 应用层扩展头信息，headers 交换机会检查此字段进行路由
+	Exchange        string     // 目标交换机名称
 	ContentType     string     // MIME 内容类型，如 "application/json"
-	DeliveryMode    uint8      // 持久化模式：Transient(1) 或 Persistent(2)
 	Expiration      string     // 消息 TTL（毫秒字符串），超时后丢弃或投递到死信队列
 	ContentEncoding string     // MIME 内容编码，如 "utf-8"、"gzip"
-	Priority        uint8      // 消息优先级（0-9），需队列启用优先级支持
 	CorrelationID   string     // 关联标识符，通常用于 RPC 模式匹配请求与响应
 	ReplyTo         string     // 回复目标队列名，用于 RPC 模式指定响应队列
 	MessageID       string     // 消息唯一标识符，由发布者生成
-	Timestamp       time.Time  // 消息创建时间戳
 	Type            string     // 消息类型名称，由应用层定义语义
 	UserID          string     // 发布者用户 ID（如 "guest"），服务器可验证）
 	AppID           string     // 发布应用 ID，用于标识消息来源
-	Headers         amqp.Table // 应用层扩展头信息，headers 交换机会检查此字段进行路由
+	Mandatory       bool       // true 时若消息无法路由到任何队列，服务器通过 basic.return 返回给发布者
+	Immediate       bool       // true 时若消费者不可立即接收消息，服务器通过 basic.return 返回给发布者；注意 RabbitMQ 3.x 已废弃此标志
+	DeliveryMode    uint8      // 持久化模式：Transient(1) 或 Persistent(2)
+	Priority        uint8      // 消息优先级（0-9），需队列启用优先级支持
 }
 
 // WithPublishOptionsExchange 设置发布目标的交换机名称。

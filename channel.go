@@ -12,7 +12,7 @@ import (
 // 相比 Publisher/Consumer 的高层封装，Channel 提供更底层的控制能力，
 // 适合需要直接操作 AMQP 通道的高级场景（如自定义消费模式、特殊声明逻辑等）。
 type Channel struct {
-	*channel.Manager
+	*channel.Manager // 内嵌通道管理器，直接暴露其所有 Safe 方法供调用方使用
 }
 
 // NewChannel 创建并初始化一个 AMQP 通道实例。

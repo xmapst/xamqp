@@ -38,19 +38,19 @@ const (
 // handlerMu 用于等待当前正在处理的消息完成（优雅关闭），
 // 防止关闭时丢失正在处理中的消息。
 type Consumer struct {
-	chanManager                *channel.Manager
-	reconnectErrCh             <-chan error
-	closeConnectionToManagerCh chan<- struct{}
-	options                    ConsumerOptions
-	handlerMu                  *sync.RWMutex // 读写锁用于等待处理中的消息完成
+	chanManager                *channel.Manager // 底层通道管理器，负责实际的通道建立/重连
+	reconnectErrCh             <-chan error     // 订阅自 chanManager 的重连事件通道，触发重新开始消费
+	closeConnectionToManagerCh chan<- struct{}  // 取消订阅信号：cleanupResources 时写入，通知 chanManager 停止推送重连事件
+	options                    ConsumerOptions  // 创建时传入的消费者选项快照
+	handlerMu                  *sync.RWMutex    // 读写锁用于等待处理中的消息完成
 
-	isClosedMu *sync.RWMutex
-	isClosed   bool
+	isClosedMu *sync.RWMutex // 保护 isClosed 的并发读写
+	isClosed   bool          // 是否已关闭，关闭后拒绝处理新消息、停止重连恢复
 }
 
 // Delivery 封装 amqp.Delivery，代表从队列收到的一条待处理消息。
 type Delivery struct {
-	amqp.Delivery
+	amqp.Delivery // 内嵌原生投递内容，含消息体、Headers、Ack/Nack 方法等
 }
 
 // NewConsumer 创建消费者并连接到指定队列，立即开始接收消息。
@@ -109,15 +109,13 @@ func (consumer *Consumer) Run(handler Handler) error {
 		defer consumer.handlerMu.RUnlock()
 		return handler(d)
 	}
-	err := consumer.startConsumer(handlerWrapper)
-	if err != nil {
+	if err := consumer.startConsumer(handlerWrapper); err != nil {
 		return err
 	}
 
 	go func() {
 		for range consumer.reconnectErrCh {
-			err = consumer.startConsumer(handlerWrapper)
-			if err != nil {
+			if err := consumer.startConsumer(handlerWrapper); err != nil {
 				consumer.options.Logger.Warnf("error restarting consumer goroutines: %v", err)
 			}
 		}
@@ -152,16 +150,25 @@ func (consumer *Consumer) startConsumer(handlerWrapper Handler) error {
 // Close 关闭消费者，默认等待当前处理中的消息完成后再关闭。
 //
 // 若需要设置等待超时，使用 CloseWithContext 方法。
-// 仅调用一次，重复调用行为未定义。
+// 幂等：重复调用是安全的，第二次及以后的调用是空操作。
 func (consumer *Consumer) Close() {
 	consumer.CloseWithContext(context.Background())
 }
 
 // cleanupResources 执行实际的关闭操作：标记关闭状态、关闭 AMQP 通道、通知连接管理器。
+//
+// 幂等：重复调用直接返回，避免重复关闭 channel 或重复向
+// closeConnectionToManagerCh 发送（后者若不加保护，每次重复调用都会
+// 泄漏一个永远阻塞在发送上的 goroutine，因为取消订阅信号只被接收一次）。
 func (consumer *Consumer) cleanupResources() {
 	consumer.isClosedMu.Lock()
-	defer consumer.isClosedMu.Unlock()
+	if consumer.isClosed {
+		consumer.isClosedMu.Unlock()
+		return
+	}
 	consumer.isClosed = true
+	consumer.isClosedMu.Unlock()
+
 	// 关闭 AMQP 通道通知 RabbitMQ 服务器停止投递消息
 	err := consumer.chanManager.Close()
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/xmapst/xamqp/internal/backoff"
 	"github.com/xmapst/xamqp/internal/dispatcher"
 	"github.com/xmapst/xamqp/internal/logger"
 )
@@ -32,6 +33,7 @@ type Manager struct {
 	amqpConfig          amqp.Config      // 建立连接时使用的协商参数，创建后不再变更
 	connectionMu        *sync.RWMutex    // 读写锁：保护 connection/closed 字段
 	closed              bool             // 是否已调用 Close，受 connectionMu 保护，防止与在途重连竞争
+	closeSignal         chan struct{}    // Close() 时关闭，用于立刻打断正在等待退避的 reconnectLoop
 	ReconnectInterval   time.Duration    // 首次重连等待时间（指数退避的基础值）
 	reconnectionCount   uint             // 累计重连次数
 	reconnectionCountMu *sync.Mutex      // 单独保护重连计数，避免与 connectionMu 产生锁竞争
@@ -82,6 +84,7 @@ func New(resolver IResolver, conf amqp.Config, log logger.ILogger, reconnectInte
 		resolver:                           resolver,
 		amqpConfig:                         conf,
 		connectionMu:                       &sync.RWMutex{},
+		closeSignal:                        make(chan struct{}),
 		ReconnectInterval:                  reconnectInterval,
 		reconnectionCount:                  0,
 		reconnectionCountMu:                &sync.Mutex{},
@@ -101,8 +104,9 @@ func New(resolver IResolver, conf amqp.Config, log logger.ILogger, reconnectInte
 
 // Close 安全关闭 AMQP 连接，通知 RabbitMQ 服务器正常断开。
 //
-// 幂等：重复调用直接返回 nil。同时标记 closed，
+// 幂等：重复调用直接返回 nil。同时标记 closed 并关闭 closeSignal，
 // 使任何在途的 reconnect() 在完成拨号后能感知到关闭并放弃安装新连接，
+// 也使正在等待退避的 reconnectLoop 立刻退出，而不必等满一整个退避周期，
 // 避免 Close 与重连竞争导致产生一个再也无法关闭的孤立连接。
 func (m *Manager) Close() error {
 	m.connectionMu.Lock()
@@ -112,6 +116,7 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	close(m.closeSignal)
 
 	m.logger.Infof("closing connection manager...")
 	return m.connection.Close()
@@ -166,14 +171,23 @@ func (m *Manager) incrementReconnectionCount() {
 	m.reconnectionCount++
 }
 
-// reconnectLoop 持续重连直到成功或管理器被关闭，使用指数退避（上限 60 秒）。
+// reconnectLoop 持续重连直到成功或管理器被关闭，使用带抖动的指数退避。
+//
+// 等待退避时间时 select 着 closeSignal：Close() 会立刻打断等待并退出，
+// 不必等满一整个退避周期才发现管理器已经关闭。
 func (m *Manager) reconnectLoop() {
-	backoff := m.ReconnectInterval
-	const maxBackoff = time.Second * 60
+	attempt := 0
 
 	for {
-		m.logger.Infof("waiting %s seconds to attempt to reconnect to amqp server", backoff)
-		time.Sleep(backoff)
+		delay := backoff.Delay(m.ReconnectInterval, attempt)
+		m.logger.Infof("waiting %s to attempt to reconnect to amqp server", delay)
+		select {
+		case <-m.closeSignal:
+			m.logger.Infof("connection manager closed, stopping reconnect loop")
+			return
+		case <-time.After(delay):
+		}
+
 		err := m.reconnect()
 		if err != nil {
 			if errors.Is(err, errClosed) {
@@ -181,10 +195,7 @@ func (m *Manager) reconnectLoop() {
 				return
 			}
 			m.logger.Errorf("error reconnecting to amqp server: %v", err)
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			attempt++
 		} else {
 			m.incrementReconnectionCount()
 			go m.startNotifyClose() // 重连成功后继续监听新连接
@@ -245,10 +256,13 @@ func (m *Manager) IsClosed() bool {
 }
 
 // maskPassword 将 AMQP URL 中的密码替换为 "***"，用于安全日志输出。
+//
+// 解析失败时返回固定占位串而不是原始输入：原始字符串可能就是一个
+// 带密码、只是格式有误的连接串，直接透传会把密码原样打进日志。
 func (m *Manager) maskPassword(s string) string {
 	parsedUrl, err := url.Parse(s)
 	if err != nil {
-		return s
+		return "<unparseable url redacted>"
 	}
 	return parsedUrl.Redacted() // 标准库 Redacted() 将密码替换为 "xxxxx"
 }

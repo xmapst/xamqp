@@ -3,7 +3,6 @@ package connection
 import (
 	"slices"
 	"sync"
-	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -74,8 +73,15 @@ func (m *Manager) NotifyBlockedSafe(
 // 卡住 NotifyBlockedSafe/RemovePublisherBlockingReceiver（它们需要写锁）。
 // 发送前后持有该接收者私有的 mu 并检查 removed 标志，
 // 与 RemovePublisherBlockingReceiver 的关闭操作互斥，
-// 避免向已关闭的 channel 发送导致 panic；每个接收者的发送都带超时保护，
-// 与 dispatcher.Dispatch 的做法一致。
+// 避免向已关闭的 channel 发送导致 panic。
+//
+// 发送本身是非阻塞的"保留最新值"语义（要求 br.ch 是容量为 1 的 buffered
+// channel，由 publish_flow_block.go 创建）：能直接放入就放入；
+// 放不进去说明接收者还没消费上一个值，先丢弃那个旧值再放入最新值。
+// 这样广播协程永远不会被某个迟迟不消费的接收者卡住，同时保证接收者
+// 最终读到的一定是最新状态，不会像"超时即丢弃"那样永久错过一次
+// 状态翻转（例如错过一次"已解除阻塞"的通知，导致该 Publisher
+// 误以为自己一直处于阻塞状态）。
 func (m *Manager) readUniversalBlockReceiver(receiver chan amqp.Blocking) {
 	for b := range receiver {
 		m.publisherNotifyBlockingReceiversMu.RLock()
@@ -88,13 +94,29 @@ func (m *Manager) readUniversalBlockReceiver(receiver chan amqp.Blocking) {
 				br.mu.Unlock()
 				continue
 			}
-			select {
-			case br.ch <- b: // 将阻塞信号转发给每个 Publisher
-			case <-time.After(5 * time.Second):
-				m.logger.Warnf("timeout broadcasting blocking signal to a publisher")
-			}
+			sendLatestNonBlocking(br.ch, b)
 			br.mu.Unlock()
 		}
+	}
+}
+
+// sendLatestNonBlocking 尝试非阻塞地把 b 放入 ch；若 ch（容量为 1）已满，
+// 先丢弃其中排队的旧值，再放入最新值，使接收者最终总能读到最新状态。
+func sendLatestNonBlocking(ch chan amqp.Blocking, b amqp.Blocking) {
+	select {
+	case ch <- b:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- b:
+	default:
+		// 极少数情况下会与另一个并发的读取者错开导致依旧放不进去，
+		// 直接放弃这一次投递：下一次广播会带着更新的状态重试。
 	}
 }
 

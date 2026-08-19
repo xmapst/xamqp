@@ -1,12 +1,15 @@
 package channel
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/xmapst/xamqp/internal/backoff"
 	"github.com/xmapst/xamqp/internal/dispatcher"
 	"github.com/xmapst/xamqp/internal/logger"
 	"github.com/xmapst/xamqp/internal/manager/connection"
@@ -18,7 +21,7 @@ import (
 // 每个 Publisher/Consumer 持有独立的通道，通道异常不影响其他通道。
 //
 // 并发安全：
-//   - channelMu RWMutex 保护 channel/closed 字段的并发访问
+//   - channelMu RWMutex 保护 channel/closed/confirmMode 字段的并发访问
 //   - 读操作（Consume/Publish/Declare 等）持有读锁，允许并发
 //   - 写操作（reconnect/Close）持有写锁，独占访问
 //   - reconnectionCountMu 单独保护重连计数，避免与 channelMu 产生锁竞争
@@ -28,6 +31,8 @@ type Manager struct {
 	connManager         *connection.Manager    // 所属的连接管理器，重连时用于借用连接开新通道
 	channelMu           *sync.RWMutex          // 读写锁：允许多读单写
 	closed              bool                   // 是否已调用 Close，受 channelMu 保护，防止与在途重连竞争
+	closeSignal         chan struct{}          // Close() 时关闭，用于立刻打断正在等待退避的 reconnectLoop
+	confirmMode         bool                   // 是否已进入 confirm 模式，受 channelMu 保护；重连时据此在新通道上重新启用
 	reconnectInterval   time.Duration          // 首次重连等待时间（指数退避的基础值）
 	reconnectionCount   uint                   // 累计重连次数，用于确认消息的 ID 计算
 	reconnectionCountMu *sync.Mutex            // 单独保护重连计数，避免与 channelMu 产生锁竞争
@@ -43,6 +48,7 @@ func New(connManager *connection.Manager, log logger.ILogger, reconnectInterval 
 		logger:              log,
 		connManager:         connManager,
 		channelMu:           &sync.RWMutex{},
+		closeSignal:         make(chan struct{}),
 		reconnectInterval:   reconnectInterval,
 		reconnectionCount:   0,
 		reconnectionCountMu: &sync.Mutex{},
@@ -123,17 +129,23 @@ func (m *Manager) incrementReconnectionCount() {
 	m.reconnectionCount++
 }
 
-// reconnectLoop 持续尝试重建通道，使用指数退避策略（最大等待 60 秒），直到成功或管理器被关闭。
+// reconnectLoop 持续尝试重建通道，使用带抖动的指数退避，直到成功或管理器被关闭。
 //
-// 指数退避的意义：避免在服务器故障期间因频繁重试加剧服务器负载，
-// 同时通过设置上限（60s）保证最终能在合理时间内重连。
+// 等待退避时间时 select 着 closeSignal：Close() 会立刻打断等待并退出，
+// 不必等满一整个退避周期才发现管理器已经关闭。
 func (m *Manager) reconnectLoop() {
-	backoff := m.reconnectInterval
-	const maxBackoff = time.Second * 60
+	attempt := 0
 
 	for {
-		m.logger.Infof("waiting %s seconds to attempt to reconnect to amqp server", backoff)
-		time.Sleep(backoff)
+		delay := backoff.Delay(m.reconnectInterval, attempt)
+		m.logger.Infof("waiting %s to attempt to reconnect to amqp server", delay)
+		select {
+		case <-m.closeSignal:
+			m.logger.Infof("channel manager closed, stopping reconnect loop")
+			return
+		case <-time.After(delay):
+		}
+
 		err := m.reconnect()
 		if err != nil {
 			if errors.Is(err, errClosed) {
@@ -141,10 +153,7 @@ func (m *Manager) reconnectLoop() {
 				return
 			}
 			m.logger.Errorf("error reconnecting to amqp server: %v", err)
-			backoff *= 2 // 指数退避：每次失败后等待时间翻倍
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			attempt++
 		} else {
 			m.incrementReconnectionCount()
 			go m.startNotifyCancelOrClosed() // 重连成功后继续监听新通道的异常
@@ -153,10 +162,23 @@ func (m *Manager) reconnectLoop() {
 	}
 }
 
-// reconnect 建立新通道后，仅在写锁保护下做指针替换，避免长时间持锁做网络 I/O（开通道 RPC）。
+// reconnect 建立新通道后，在写锁保护下做指针替换；开通道 RPC 本身在锁外完成，
+// 避免长时间持锁做网络 I/O。
 //
 // 若此时管理器已被 Close，则丢弃刚建立的新通道并返回 errClosed，
 // 防止 Close 与重连竞争产生一个再也没有人引用、也没有人能关闭的孤立通道。
+//
+// 例外：若此前已通过 ConfirmSafe 进入过 confirm 模式，会在安装新通道的
+// 同一把写锁临界区内于新通道上重新启用 confirm 模式（newChannel.Confirm），
+// 而不是先解锁再做——这是有意的取舍：只有这样才能保证"新通道对外可见"
+// 和"confirm 模式已重新启用"这两件事原子发生，不会出现"重连已完成、
+// 但还没来得及重新进入 confirm 模式"的窗口（该窗口期间发布的消息会拿到
+// nil 的 DeferredConfirmation，静默地失去确认保证）。代价是 Confirm 这次
+// AMQP RPC 本身没有超时/ctx（amqp091-go 未提供），最坏情况下会在写锁内
+// 阻塞到连接心跳超时为止；期间所有走 lockChannelRead 的 Publish 系列调用
+// 能通过 ctx 提前退出，但其余仍用裸 RLock 的 *Safe 方法（Consume/Declare/
+// Qos/Notify* 等）会跟着无条件卡住。只在开启了确认模式的 Publisher 触发
+// 重连时才会命中，且有连接心跳兜底，不会永久卡死。
 func (m *Manager) reconnect() error {
 	newChannel, err := m.getNewChannel()
 	if err != nil {
@@ -170,6 +192,16 @@ func (m *Manager) reconnect() error {
 			m.logger.Warnf("error closing redundant channel after manager was closed: %v", cerr)
 		}
 		return errClosed
+	}
+
+	if m.confirmMode {
+		if cerr := newChannel.Confirm(false); cerr != nil {
+			m.channelMu.Unlock()
+			if cerr2 := newChannel.Close(); cerr2 != nil {
+				m.logger.Warnf("error closing channel after failed confirm re-arm: %v", cerr2)
+			}
+			return fmt.Errorf("failed to re-arm confirm mode after reconnect: %w", cerr)
+		}
 	}
 
 	oldChannel := m.channel
@@ -187,8 +219,9 @@ func (m *Manager) reconnect() error {
 
 // Close 安全关闭 AMQP 通道，释放服务器端资源。
 //
-// 幂等：重复调用直接返回 nil。同时标记 closed，
-// 使任何在途的 reconnect() 在完成开通道 RPC 后能感知到关闭并放弃安装新通道。
+// 幂等：重复调用直接返回 nil。同时标记 closed 并关闭 closeSignal，
+// 使任何在途的 reconnect() 在完成开通道 RPC 后能感知到关闭并放弃安装新通道，
+// 也使正在等待退避的 reconnectLoop 立刻退出。
 func (m *Manager) Close() error {
 	m.channelMu.Lock()
 	defer m.channelMu.Unlock()
@@ -197,6 +230,7 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	close(m.closeSignal)
 
 	m.logger.Infof("closing channel manager...")
 	err := m.channel.Close()
@@ -206,6 +240,35 @@ func (m *Manager) Close() error {
 	}
 
 	return nil
+}
+
+// lockChannelRead 在 ctx 未取消的前提下获取通道读锁。
+//
+// 先尝试非阻塞的 TryRLock；若暂时拿不到（例如正在重连、写锁被占用），
+// 转为按 1 毫秒间隔轮询 TryRLock，同时 select 着 ctx.Done()。
+// 这样调用方传入的超时/取消能够中断等待，而不是像裸 RLock() 那样
+// 无条件阻塞到写锁释放为止——否则一次正在进行的重连会让所有携带
+// 较短超时的 Publish 调用统统卡穿其 ctx 的deadline。
+func (m *Manager) lockChannelRead(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.channelMu.TryRLock() {
+		return nil
+	}
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if m.channelMu.TryRLock() {
+				return nil
+			}
+		}
+	}
 }
 
 // NotifyReconnect 订阅通道重连成功事件，返回事件通道和关闭信号通道。

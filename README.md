@@ -50,11 +50,11 @@
 
 ### 1. 自动重连
 
-[`Conn`](connection.go:16) 基于内部连接管理器封装了 RabbitMQ 连接生命周期；[`Consumer`](consume.go:40)、[`Publisher`](publish.go:51)、[`Channel`](channel.go:14) 基于通道管理器继续实现通道级恢复。当连接或通道异常关闭时，库会自动进行指数退避重连。
+[`Conn`](connection.go:16) 基于内部连接管理器封装了 RabbitMQ 连接生命周期；[`Consumer`](consume.go:40)、[`Publisher`](publish.go:64)、[`Channel`](channel.go:14) 基于通道管理器继续实现通道级恢复。当连接或通道异常关闭时，库会自动进行带抖动的指数退避重连。
 
 - 初始退避由 [`ConnectionOptions.ReconnectInterval`](connection_options.go:9) 控制
-- 失败后按指数退避增长
-- 最大退避时间为 60 秒，见 [`reconnectLoop()`](internal/manager/connection/connection.go:162) 与 [`reconnectLoop()`](internal/manager/channel/channel.go:126)
+- 失败后按指数退避增长，封顶 16 倍初始值，并叠加最多 25% 的随机抖动，避免同一 Broker 下的大量客户端在网络恢复后集中在同一时刻重连（惊群效应），见 [`internal/backoff.Delay()`](internal/backoff/backoff.go:16)
+- 调用 `Close()` 会立刻打断正在等待退避的重连协程，不需要等满一个退避周期，见 [`reconnectLoop()`](internal/manager/connection/connection.go:170) 与 [`reconnectLoop()`](internal/manager/channel/channel.go:130)
 
 ### 2. 高层抽象
 
@@ -70,10 +70,12 @@
 ### 3. 面向生产环境的行为细节
 
 - 消费者支持并发消费，见 [`ConsumerOptions.Concurrency`](consumer_options.go:75)
-- 支持优雅关闭，见 [`CloseWithContext()`](consume.go:181)
-- 支持发布确认，见 [`NotifyPublish()`](publish.go:323)
-- 支持 `mandatory` 退回处理，见 [`NotifyReturn()`](publish.go:307)
-- 支持 RabbitMQ `Flow` 与连接 `Blocking` 背压控制，见 [`startNotifyFlowHandler()`](publish_flow_block.go:13) 与 [`startNotifyBlockedHandler()`](publish_flow_block.go:44)
+- 消费者 [`Run()`](consume.go:103) 不阻塞调用方：首次启动成功即返回，后续重连恢复在后台协程中进行；首次启动失败（例如队列参数与已有队列不匹配）会直接把错误返回给调用方，不做重试
+- 支持优雅关闭，见 [`CloseWithContext()`](consume.go:214)
+- 支持发布确认，见 [`NotifyPublish()`](publish.go:394)；`Publish`/`PublishWithContext` 始终是 fire-and-forget，即使开启了确认模式也不会阻塞等待 Broker 确认——确认结果只通过 `NotifyPublish` 回调异步交付，需要同步等待某条消息确认时请使用 [`PublishWithDeferredConfirmWithContext()`](publish.go:279)
+- 流控/阻塞导致发布被拒绝时返回可用 `errors.Is` 判断的哨兵错误 [`ErrPublishFlowPaused`](publish.go:30) / [`ErrPublishBlocked`](publish.go:36)
+- 支持 `mandatory` 退回处理，见 [`NotifyReturn()`](publish.go:377)
+- 支持 RabbitMQ `Flow` 与连接 `Blocking` 背压控制，见 [`startNotifyFlowHandler()`](publish_flow_block.go:13) 与 [`startNotifyBlockedHandler()`](publish_flow_block.go:44)；`Blocking` 状态广播采用"保留最新值"语义，慢订阅者不会拖慢广播，也不会永久错过一次状态翻转
 - 支持队列参数透传，如 `x-message-ttl`、`x-expires`、`x-queue-type=quorum`
 
 ---
@@ -268,17 +270,28 @@ func declare(conn *xamqp.Conn) {
 
 ### 3. 创建消费者
 
+`Run()` 首次启动成功后立即返回，不会阻塞调用方；`defer consumer.Close()` 紧跟在 `Run()` 之后没有意义——那一行代码所在的函数一返回，消费者就会立刻被关闭。正确的做法是在业务侧自行阻塞主流程（例如等待 OS 信号），关闭动作放在真正要退出时执行：
+
 ```go
 package main
 
 import (
     "log"
+    "os"
+    "os/signal"
+    "syscall"
 
     amqp "github.com/rabbitmq/amqp091-go"
     "github.com/xmapst/xamqp"
 )
 
-func startConsumer(conn *xamqp.Conn) {
+func main() {
+    conn, err := xamqp.NewConn("amqp://guest:guest@127.0.0.1:5672/")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close()
+
     consumer, err := xamqp.NewConsumer(
         conn,
         "orders.created",
@@ -293,7 +306,10 @@ func startConsumer(conn *xamqp.Conn) {
     if err != nil {
         log.Fatal(err)
     }
+    defer consumer.Close()
 
+    // Run() 只在“首次”启动失败时返回错误（例如队列参数与已有队列不一致），
+    // 值得 log.Fatal；启动成功后它立即返回 nil，后续重连恢复在后台协程里进行。
     err = consumer.Run(func(d xamqp.Delivery) xamqp.Action {
         log.Printf("received: %s", string(d.Body))
         return xamqp.Ack
@@ -302,7 +318,10 @@ func startConsumer(conn *xamqp.Conn) {
         log.Fatal(err)
     }
 
-    defer consumer.Close()
+    // Run() 不阻塞，这里需要自行等待退出信号，程序才不会立刻结束。
+    sig := make(chan os.Signal, 1)
+    signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+    <-sig
 }
 ```
 
@@ -434,7 +453,7 @@ func (r *MyResolver) Resolve() ([]string, error) {
 - 你不希望使用高层 `Publisher` / `Consumer` 抽象
 - 你需要自定义更底层的 AMQP 操作
 
-创建时会先应用 [`ChannelOptions.QOSPrefetch`](channel_options.go:6) 与 [`ChannelOptions.QOSGlobal`](channel_options.go:7)，如果 QoS 设置失败会直接返回错误，避免通道带着错误配置继续被使用，见 [`NewChannel()`](channel.go:22)。
+创建时会先应用 [`ChannelOptions.QOSPrefetch`](channel_options.go:6) 与 [`ChannelOptions.QOSGlobal`](channel_options.go:7)；若同时设置了 [`ChannelOptions.ConfirmMode`](channel_options.go:8)（通过 [`WithChannelOptionsConfirm()`](channel_options.go:54)），也会一并让通道进入发布确认模式。QoS 或确认模式任一步设置失败都会直接关闭通道并返回错误，避免通道带着错误配置继续被使用，见 [`NewChannel()`](channel.go:22)。
 
 ---
 
@@ -464,9 +483,9 @@ func (r *MyResolver) Resolve() ([]string, error) {
 
 - [`NewConsumer()`](consume.go:61)
 - [`Run()`](consume.go:103)
-- [`Close()`](consume.go:156)
-- [`CloseWithContext()`](consume.go:181)
-- [`IsClosed()`](consume.go:253)
+- [`Close()`](consume.go:162)
+- [`CloseWithContext()`](consume.go:214)
+- [`IsClosed()`](consume.go:286)
 
 ### 消费流程
 
@@ -479,9 +498,11 @@ func (r *MyResolver) Resolve() ([]string, error) {
 5. 调用 `basic.consume`
 6. 按 [`ConsumerOptions.Concurrency`](consumer_options.go:75) 启动多个处理 goroutine
 
+**`Run()` 不会阻塞调用方**：首次启动成功后立即返回 `nil`，业务代码需要自行阻塞主流程（例如等待 OS 信号），否则程序会在 `Run()` 返回后继续往下执行、乃至退出。首次启动失败（例如声明队列时参数与已存在的队列不一致）会把这个错误直接返回给调用方，不做任何重试，方便调用方判断这是一次性的、可能需要人工介入的配置问题。首次启动成功之后，若连接因网络问题等原因重连，恢复消费的过程改为在后台协程中以固定退避无限重试，直到成功或 `Close()`。
+
 ### panic 处理
 
-消费 handler 中如果发生 panic，库会在 [`handlerWrapper()`](consume.go:282) 中恢复，记录错误日志，并在非自动确认模式下对当前消息执行 `Nack(requeue=false)`，防止毒丸消息不断触发消费者崩溃。
+消费 handler 中如果发生 panic，库会在 [`handlerWrapper()`](consume.go:315) 中恢复，记录错误日志，并在非自动确认模式下对当前消息执行 `Nack(requeue=false)`，防止毒丸消息不断触发消费者崩溃。
 
 ### 优雅关闭
 
@@ -493,48 +514,61 @@ func (r *MyResolver) Resolve() ([]string, error) {
 
 如果希望快速退出，可使用 [`WithConsumerOptionsForceShutdown()`](consumer_options.go:347)。
 
+`Close()`/`CloseWithContext()` 是幂等的，重复调用是安全的空操作。
+
 ---
 
 ## 发布者 `Publisher`
 
 入口：
 
-- [`NewPublisher()`](publish.go:80)
-- [`Publish()`](publish.go:150)
-- [`PublishWithContext()`](publish.go:163)
-- [`PublishWithDeferredConfirmWithContext()`](publish.go:226)
-- [`NotifyReturn()`](publish.go:307)
-- [`NotifyPublish()`](publish.go:323)
-- [`Close()`](publish.go:290)
+- [`NewPublisher()`](publish.go:97)
+- [`Publish()`](publish.go:197)
+- [`PublishWithContext()`](publish.go:210)
+- [`PublishWithDeferredConfirmWithContext()`](publish.go:279)
+- [`NotifyReturn()`](publish.go:377)
+- [`NotifyPublish()`](publish.go:394)
+- [`Close()`](publish.go:347)
 
 ### 发布行为
 
-[`PublishWithContext()`](publish.go:163) 支持：
+[`PublishWithContext()`](publish.go:210) 支持：
 
 - 一次向多个路由键发布同一条消息
 - 为每个路由键单独调用 AMQP 发布
 - 发布前检查 `Flow` 与 `Blocking` 状态
 - 将 `PublishOptions` 映射到 `amqp.Publishing`
+- 始终是 fire-and-forget：即使开启了确认模式，也不会在这里同步等待 Broker 的确认结果——确认只通过 [`NotifyPublish()`](publish.go:394) 异步回调交付。需要同步等待某一条消息真正落盘确认时，改用 [`PublishWithDeferredConfirmWithContext()`](publish.go:279)，对返回的 `DeferredConfirmation` 调用 `Wait()`/`WaitContext()`
 
 ### 背压与流控
 
 当 RabbitMQ 服务器压力较大时：
 
 - [`startNotifyFlowHandler()`](publish_flow_block.go:13) 会接收服务器 `Flow` 信号
-- [`startNotifyBlockedHandler()`](publish_flow_block.go:44) 会接收连接 `Blocking` 信号
+- [`startNotifyBlockedHandler()`](publish_flow_block.go:44) 会接收连接 `Blocking` 信号（该信号在构造时只注册一次，重连不会重复注册，也不会因为某个 Publisher 迟迟不消费而拖慢广播或让其他 Publisher 错过状态变化）
 
-此时发布者会临时拒绝新的发布请求，并返回错误：
+此时发布者会临时拒绝新的发布请求，并返回可用 `errors.Is` 判断的哨兵错误：
 
-- `publishing blocked due to high flow on the server`
-- `publishing blocked due to TCP block on the server`
+- [`ErrPublishFlowPaused`](publish.go:30)（对应 `publishing blocked due to high flow on the server`）
+- [`ErrPublishBlocked`](publish.go:36)（对应 `publishing blocked due to TCP block on the server`）
 
-调用方应在业务侧做重试、退避或熔断。
+调用方应在业务侧做重试、退避或熔断，例如：
+
+```go
+if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublishBlocked) {
+    // 服务器暂时性压力，稍后重试
+}
+```
 
 ### 发布确认
 
-启用 [`WithPublisherOptionsConfirm()`](publisher_options.go:105) 后，可通过 [`NotifyPublish()`](publish.go:323) 监听确认结果。
+启用 [`WithPublisherOptionsConfirm()`](publisher_options.go:105) 后：
 
-确认结构体 [`Confirmation`](publish.go:38) 额外带有 [`ReconnectionCount`](publish.go:40)，用于区分重连前后的投递标签范围，避免只依赖 `DeliveryTag` 造成歧义。
+- `NewPublisher()` 会同步确认通道成功进入 confirm 模式，失败则直接返回错误，不会返回一个"自称开启了确认、实际并未确认"的 `Publisher`
+- 通道因重连而更换后，confirm 模式会在新通道可用的同一时刻原子性地重新启用，不存在"重连完成但还没来得及重新进入 confirm 模式"的窗口
+- 可通过 [`NotifyPublish()`](publish.go:414) 监听确认结果；handler 按事件并发调用（内部用信号量把并发数限制在 100），不保证 `DeliveryTag` 到达顺序——这是有意的取舍：amqp091-go 用同一个协程读取整条连接上所有通道的帧，同步调用业务 handler 会让一个慢 handler 连带卡住共用同一条连接的其他 Publisher/Consumer，并发派发能避免这一点
+
+确认结构体 [`Confirmation`](publish.go:51) 额外带有 [`ReconnectionCount`](publish.go:53)，用于区分重连前后的投递标签范围，避免只依赖 `DeliveryTag` 造成歧义。
 
 ---
 
@@ -578,7 +612,7 @@ func (r *MyResolver) Resolve() ([]string, error) {
 - [`WithChannelOptionsLogger()`](channel_options.go:44)
 - [`WithChannelOptionsConfirm()`](channel_options.go:54)
 
-说明：目前 [`ChannelOptions.ConfirmMode`](channel_options.go:8) 在 [`NewChannel()`](channel.go:22) 中未实际启用确认模式，若需要确认能力，推荐直接使用 [`Publisher`](publish.go:51)。
+说明：[`ChannelOptions.ConfirmMode`](channel_options.go:8) 会在 [`NewChannel()`](channel.go:22) 中实际启用确认模式（失败则创建返回错误）；但 `Channel` 是底层原语封装，不像 `Publisher` 那样在重连后自动重新声明拓扑、重新注册确认回调，多数场景仍建议优先使用 [`Publisher`](publish.go:64)。
 
 ---
 
@@ -825,6 +859,36 @@ gorabbit WARN: pausing publishing due to flow request from server
 
 建议在生产环境中接入业务统一日志系统，便于关联链路、监控和告警。
 
+注意：`ILogger` 只有 `Errorf`/`Warnf`/`Infof`/`Debugf` 四个方法，没有 `Fatalf`。
+
+---
+
+## 示例程序
+
+[`examples`](examples) 目录下提供了一组可以直接 `go run` 的独立示例：
+
+- [`examples/consumer`](examples/consumer/main.go)：单消费者，声明交换机/队列/绑定后消费消息
+- [`examples/publisher`](examples/publisher/main.go)：基本发布，演示对 [`ErrPublishFlowPaused`](publish.go:30)/[`ErrPublishBlocked`](publish.go:36) 的判断
+- [`examples/publisher_confirm`](examples/publisher_confirm/main.go)：对比 `NotifyPublish` 异步确认与 `PublishWithDeferredConfirmWithContext` 同步等待两种确认方式
+- [`examples/multiconsumer`](examples/multiconsumer/main.go)：同一个 `Conn` 下运行多个独立 `Consumer`
+- [`examples/multipublisher`](examples/multipublisher/main.go)：定时发布循环，配合信号实现优雅关闭
+- [`examples/logger`](examples/logger/main.go)：实现自定义 `ILogger` 并注入
+- [`examples/cluster`](examples/cluster/main.go)：`NewClusterConn` 与自定义 `IResolver`
+
+运行前需要一个可访问的 RabbitMQ 实例（默认 `amqp://guest:guest@127.0.0.1:5672/`）。
+
+---
+
+## 集成测试
+
+[`integration_test.go`](integration_test.go) 提供了针对真实 RabbitMQ Broker 的集成测试，默认跳过。设置环境变量后才会真正用 Docker 启动一个 RabbitMQ 容器并执行：
+
+```bash
+ENABLE_DOCKER_INTEGRATION_TESTS=TRUE go test -v ./...
+```
+
+需要本机安装并可用 `docker` 命令。覆盖内容包括基本发布/消费闭环、`Close()` 系列方法的幂等性、通道重连后 confirm 模式的原子恢复、以及并发派发下确认事件不丢不重。
+
 ---
 
 ## 适用场景建议
@@ -846,14 +910,16 @@ gorabbit WARN: pausing publishing due to flow request from server
 
 ## 注意事项
 
-1. [`PublishWithContext()`](publish.go:163) 在 Broker 流控或连接阻塞时会直接返回错误，调用方需要自行重试。
+1. [`PublishWithContext()`](publish.go:210) 在 Broker 流控或连接阻塞时会直接返回 [`ErrPublishFlowPaused`](publish.go:30)/[`ErrPublishBlocked`](publish.go:36)，调用方需要自行重试；即使开启了确认模式，这两个方法也不会阻塞等待 Broker ack，需要同步确认请用 [`PublishWithDeferredConfirmWithContext()`](publish.go:279)。
 2. [`WithPublishOptionsImmediate()`](publish_options.go:47) 对应的 `Immediate` 标志在 RabbitMQ 3.x 中已废弃，使用前请确认 Broker 行为。
 3. 消费者并发数高于 1 时，消息处理顺序不再严格等同于入队顺序。
 4. [`WithConsumerOptionsConsumerAutoAck()`](consumer_options.go:295) 开启后，消息一投递即视为成功消费，处理失败无法依赖 AMQP 重试。
 5. 使用持久化消息时，请同时考虑交换机、队列、消息三者的持久化组合策略。
 6. 自动重连不保证业务层 exactly-once，需要结合幂等键、去重表或事务外盒模式。
 7. [`WithConsumerStreamOffset()`](consumer_options.go:380) 用于 RabbitMQ Streams 相关参数透传，具体能力依赖 Broker 配置与队列类型。
-8. 当前 README 基于仓库现有源码整理；若后续 API 发生变化，请以源码与 GoDoc 为准。
+8. [`Consumer.Run()`](consume.go:103) 不阻塞调用方，首次启动成功后立即返回；业务代码需要自行阻塞主流程（等待信号、`select {}` 等），不要假设 `Run()` 会像某些同类库那样一直阻塞到关闭。
+9. `Consumer.Run()` 首次启动失败会直接返回错误、不重试，请显式处理该错误（多半意味着队列/交换机参数与已有资源不匹配等需要人工介入的问题）。
+10. 当前 README 基于仓库现有源码整理；若后续 API 发生变化，请以源码与 GoDoc 为准。
 
 ---
 

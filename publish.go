@@ -23,6 +23,18 @@ const (
 	Persistent = amqp.Persistent
 )
 
+// ErrPublishFlowPaused 表示因服务器请求的流控（Flow）而暂停发布。
+//
+// 属于可重试错误：调用方可用 errors.Is(err, ErrPublishFlowPaused) 判断，
+// 并在稍后重试而不是当作永久性失败处理。
+var ErrPublishFlowPaused = errors.New("publishing blocked due to high flow on the server")
+
+// ErrPublishBlocked 表示因 TCP 级别的连接阻塞而暂停发布。
+//
+// 属于可重试错误：调用方可用 errors.Is(err, ErrPublishBlocked) 判断，
+// 并在稍后重试而不是当作永久性失败处理。
+var ErrPublishBlocked = errors.New("publishing blocked due to TCP block on the server")
+
 // Return 捕获因 mandatory 或 immediate 标志导致无法路由到队列的消息信息。
 //
 // 当消息设置了 mandatory=true 但没有匹配的队列时，
@@ -114,6 +126,12 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 
 	err = publisher.startup()
 	if err != nil {
+		// 用 publisher.Close() 而非只关 chanManager：此时 dispatcher 订阅
+		// （NotifyReconnect 返回的 closeConnectionToManagerCh）已经建立，
+		// 只关 chanManager 会让 dispatcher 里那个等待取消信号的清理协程
+		// 永久泄漏。publisher.blocking 此时还是 nil，Close() 会正确跳过
+		// RemovePublisherBlockingReceiver，不会误操作。
+		publisher.Close()
 		return nil, err
 	}
 
@@ -121,15 +139,25 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 	// publisher.blocking 已就绪，即使调用方随后立即 Close() 也不会漏清理。
 	publisher.startNotifyBlockedHandler()
 
-	// ConfirmMode：注册空白处理器使通道进入 confirm 模式，实际处理由业务代码注册
+	// ConfirmMode：先同步确认通道成功进入 confirm 模式再返回，
+	// 避免调用方拿到一个自称开启了 ConfirmMode、实际并未真正确认消息的 Publisher。
+	// ConfirmSafe 是幂等的，随后 NotifyPublish 内部再次调用不会重复生效。
 	if options.ConfirmMode {
+		if err = publisher.chanManager.ConfirmSafe(false); err != nil {
+			// 同上，用 publisher.Close() 完整清理：此时 startNotifyBlockedHandler
+			// 已经同步完成注册，publisher.blocking 非 nil，只关 chanManager
+			// 会漏掉 RemovePublisherBlockingReceiver 和 dispatcher 取消订阅，
+			// 泄漏 readBlockedNotifications 和 dispatcher 清理协程。
+			publisher.Close()
+			return nil, fmt.Errorf("could not put channel in confirm mode: %w", err)
+		}
 		publisher.NotifyPublish(func(_ Confirmation) {
 			// 空处理器：仅用于开启 confirm 模式，不处理具体确认事件
 		})
 	}
 
 	// 后台 goroutine：监听重连事件，重连后重新初始化流控监听。
-	// 与 Consumer.startConsumer 一致，startup 失败时以退避重试直到成功或
+	// 与 Consumer.startConsumerWithRetry 一致，startup 失败时以退避重试直到成功或
 	// Publisher 被关闭，而不是放弃恢复——否则一次瞬时错误就会让 Publisher
 	// 永久停止刷新流控状态和确认回调，且不给调用方任何提示。
 	go func() {
@@ -203,14 +231,14 @@ func (publisher *Publisher) PublishWithContext(
 	blockedByFlow := publisher.disablePublishDueToFlow
 	publisher.disablePublishDueToFlowMu.RUnlock()
 	if blockedByFlow {
-		return fmt.Errorf("publishing blocked due to high flow on the server")
+		return ErrPublishFlowPaused
 	}
 
 	publisher.disablePublishDueToBlockedMu.RLock()
 	blockedByTCP := publisher.disablePublishDueToBlocked
 	publisher.disablePublishDueToBlockedMu.RUnlock()
 	if blockedByTCP {
-		return fmt.Errorf("publishing blocked due to TCP block on the server")
+		return ErrPublishBlocked
 	}
 
 	options := &PublishOptions{}
@@ -269,14 +297,14 @@ func (publisher *Publisher) PublishWithDeferredConfirmWithContext(
 	blockedByFlow := publisher.disablePublishDueToFlow
 	publisher.disablePublishDueToFlowMu.RUnlock()
 	if blockedByFlow {
-		return nil, fmt.Errorf("publishing blocked due to high flow on the server")
+		return nil, ErrPublishFlowPaused
 	}
 
 	publisher.disablePublishDueToBlockedMu.RLock()
 	blockedByTCP := publisher.disablePublishDueToBlocked
 	publisher.disablePublishDueToBlockedMu.RUnlock()
 	if blockedByTCP {
-		return nil, fmt.Errorf("publishing blocked due to TCP block on the server")
+		return nil, ErrPublishBlocked
 	}
 
 	options := &PublishOptions{}
@@ -356,6 +384,13 @@ func (publisher *Publisher) Close() {
 // 注意：该通知只绑定在此 Publisher 自身独占的 AMQP 通道上，
 // 与其他 Publisher（即使共用同一连接）互不影响；仅当多个 goroutine
 // 并发调用同一个 Publisher 实例的 NotifyReturn 时才需要注意覆盖问题。
+//
+// handler 为每个事件单独起一个 goroutine 并发调用（见 startReturnHandler），
+// 不保证到达顺序、可能并发执行；这是有意的取舍：amqp091-go 用同一个协程
+// 读取整条底层 TCP 连接上所有通道的帧，若在那个读取循环里同步调用业务
+// handler，一个耗时较久或卡住的 handler 会连带阻塞共用同一条连接的所有
+// 其他 Publisher/Consumer。并发派发能让事件很快从内部缓冲区被取走，
+// 把这个风险降到最低。
 func (publisher *Publisher) NotifyReturn(handler func(r Return)) {
 	publisher.handlerMu.Lock()
 	start := publisher.notifyReturnHandler == nil
@@ -373,6 +408,9 @@ func (publisher *Publisher) NotifyReturn(handler func(r Return)) {
 // 此后每条发布的消息都会收到 ack 或 nack 确认。
 // 注意：该通知同样只绑定在此 Publisher 自身独占的 AMQP 通道上，
 // 不与其他 Publisher 共享（即使它们共用同一连接）。
+//
+// handler 同样为每个确认事件并发调用（受信号量限制并发数，见
+// startPublishHandler），语义和取舍同 NotifyReturn。
 func (publisher *Publisher) NotifyPublish(handler func(p Confirmation)) {
 	publisher.handlerMu.Lock()
 	shouldStart := publisher.notifyPublishHandler == nil
@@ -385,6 +423,12 @@ func (publisher *Publisher) NotifyPublish(handler func(p Confirmation)) {
 }
 
 // startReturnHandler 启动 basic.return 事件监听 goroutine。
+//
+// 为每个事件单独起一个 goroutine 并发调用 handler：读取事件的这个循环
+// 本身只负责尽快把事件从 channel 里取走再转手扔给新协程处理，不会被
+// 慢 handler 拖住——这个循环的读取速度直接决定 amqp091-go 共享的连接
+// 读取协程会不会被写阻塞（详见 NotifyReturn 文档），所以这里不能改成
+// 同步调用。代价是不保证多个 basic.return 之间的处理顺序。
 func (publisher *Publisher) startReturnHandler() {
 	publisher.handlerMu.Lock()
 	if publisher.notifyReturnHandler == nil {
@@ -394,17 +438,31 @@ func (publisher *Publisher) startReturnHandler() {
 	publisher.handlerMu.Unlock()
 
 	go func() {
-		returns := publisher.chanManager.NotifyReturnSafe(make(chan amqp.Return, 1))
+		returns := publisher.chanManager.NotifyReturnSafe(make(chan amqp.Return, 100))
 		for ret := range returns {
-			go publisher.notifyReturnHandler(Return{ret})
+			go publisher.invokeReturnHandler(Return{ret})
 		}
 	}()
 }
 
+// invokeReturnHandler 执行 basic.return 处理函数，通过 recover 保护防止 panic 影响整体。
+func (publisher *Publisher) invokeReturnHandler(r Return) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			publisher.options.Logger.Errorf("panic in return handler: %v", rec)
+		}
+	}()
+	publisher.notifyReturnHandler(r)
+}
+
 // startPublishHandler 开启确认模式并启动确认事件处理 goroutine。
 //
-// 使用信号量（sem）限制并发处理的确认事件数量，防止 goroutine 爆炸。
-// 确认处理函数在独立 goroutine 中执行，通过 recover 保护防止 panic 影响整体。
+// 用信号量把并发处理的确认事件数量限制在 maxConcurrentHandlers，
+// 避免海量确认事件瞬间涌入时无限制地起协程；理由同 startReturnHandler，
+// 读取循环本身仍然只负责尽快转手，不同步调用 handler。注意信号量本身
+// 意味着一旦 maxConcurrentHandlers 个 handler 同时卡住，第 101 个事件
+// 的转手会被 `sem <- struct{}{}` 卡住——这是有意选择的、有界的背压，
+// 而不是完全消除慢 handler 的影响；handler 仍然应当尽量不阻塞。
 func (publisher *Publisher) startPublishHandler() {
 	publisher.handlerMu.Lock()
 	if publisher.notifyPublishHandler == nil {
@@ -412,10 +470,13 @@ func (publisher *Publisher) startPublishHandler() {
 		return
 	}
 	publisher.handlerMu.Unlock()
-	_ = publisher.chanManager.ConfirmSafe(false)
+
+	if err := publisher.chanManager.ConfirmSafe(false); err != nil {
+		publisher.options.Logger.Errorf("could not put channel in confirm mode: %v", err)
+		return
+	}
 
 	go func() {
-		// 信号量控制并发数，防止大量确认事件导致 goroutine 数量无限增长
 		const maxConcurrentHandlers = 100
 		sem := make(chan struct{}, maxConcurrentHandlers)
 
@@ -424,16 +485,21 @@ func (publisher *Publisher) startPublishHandler() {
 			sem <- struct{}{}
 			go func(c amqp.Confirmation) {
 				defer func() { <-sem }()
-				defer func() {
-					if r := recover(); r != nil {
-						publisher.options.Logger.Errorf("panic in publish handler: %v", r)
-					}
-				}()
-				publisher.notifyPublishHandler(Confirmation{
-					Confirmation:      c,
-					ReconnectionCount: int(publisher.chanManager.ReconnectionCount()),
-				})
+				publisher.invokePublishHandler(c)
 			}(conf)
 		}
 	}()
+}
+
+// invokePublishHandler 执行发布确认处理函数，通过 recover 保护防止 panic 影响整体。
+func (publisher *Publisher) invokePublishHandler(c amqp.Confirmation) {
+	defer func() {
+		if r := recover(); r != nil {
+			publisher.options.Logger.Errorf("panic in publish handler: %v", r)
+		}
+	}()
+	publisher.notifyPublishHandler(Confirmation{
+		Confirmation:      c,
+		ReconnectionCount: int(publisher.chanManager.ReconnectionCount()),
+	})
 }

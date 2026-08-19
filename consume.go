@@ -93,13 +93,20 @@ func NewConsumer(
 	return consumer, nil
 }
 
-// Run 启动消息消费循环，并注册自动重连处理器。
+// Run 启动消息消费循环，并注册自动重连处理器。不阻塞调用方：
+// 首次启动成功后立即返回，后续的重连恢复在后台协程中进行。
 //
 // 通过 handlerMu 的读写锁实现优雅关闭：
 //   - 消息处理期间持有读锁，允许多个 goroutine 并发处理
 //   - CloseWithContext 等待读锁释放（获取写锁），确保所有消息处理完成后才关闭
 //
-// 重连策略：连接断开后每 3 秒重试一次，直到成功或消费者被关闭。
+// 首次启动失败会直接返回该错误，不做任何重试——很可能是永久性配置问题
+// （如队列参数与已存在的队列不匹配导致 PRECONDITION_FAILED），
+// 调用方应能立即拿到错误并决定如何处理，而不是被无限期挂起、
+// 却又拿不到任何能表明"启动失败"的信号。
+// 首次启动成功之后，由重连事件触发的后续恢复改用 startConsumerWithRetry，
+// 以 3 秒退避无限重试直到成功或消费者被关闭——此时已经证明过配置本身是
+// 可用的，失败大概率是网络抖动之类的临时问题，值得持续重试。
 func (consumer *Consumer) Run(handler Handler) error {
 	handlerWrapper := func(d Delivery) (action Action) {
 		// TryRLock 失败表示正在关闭，拒绝处理新消息（重新入队）
@@ -109,13 +116,14 @@ func (consumer *Consumer) Run(handler Handler) error {
 		defer consumer.handlerMu.RUnlock()
 		return handler(d)
 	}
-	if err := consumer.startConsumer(handlerWrapper); err != nil {
+	if err := consumer.startGoroutines(handlerWrapper, consumer.options); err != nil {
 		return err
 	}
+	consumer.options.Logger.Infof("successful consumer recovery")
 
 	go func() {
 		for range consumer.reconnectErrCh {
-			if err := consumer.startConsumer(handlerWrapper); err != nil {
+			if err := consumer.startConsumerWithRetry(handlerWrapper); err != nil {
 				consumer.options.Logger.Warnf("error restarting consumer goroutines: %v", err)
 			}
 		}
@@ -124,11 +132,11 @@ func (consumer *Consumer) Run(handler Handler) error {
 	return nil
 }
 
-// startConsumer 初始化消费者，声明 AMQP 资源并启动消费 goroutine。
+// startConsumerWithRetry 由重连事件触发调用：无限重试直到成功或消费者关闭。
 //
 // 若消费者已关闭则立即返回错误。
 // 若启动失败（如网络问题），等待 3 秒后重试，直到成功或消费者关闭。
-func (consumer *Consumer) startConsumer(handlerWrapper Handler) error {
+func (consumer *Consumer) startConsumerWithRetry(handlerWrapper Handler) error {
 	for {
 		if consumer.getIsClosed() {
 			return fmt.Errorf("consumer closed")

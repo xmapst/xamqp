@@ -17,8 +17,9 @@ type Channel struct {
 
 // NewChannel 创建并初始化一个 AMQP 通道实例。
 //
-// 创建时立即应用 QoS 配置，若 QoS 设置失败则关闭通道并返回错误，
-// 防止通道在非预期的 QoS 状态下被使用。
+// 创建时立即应用 QoS 配置，若开启 ChannelOptions.ConfirmMode 则同时
+// 进入发布确认模式；任一步失败都会关闭通道并返回错误，
+// 防止通道在非预期的 QoS/确认状态下被使用。
 func NewChannel(conn *Conn, optionFuncs ...func(*ChannelOptions)) (*Channel, error) {
 	options := new(getDefaultChannelOptions())
 	for _, optionFunc := range optionFuncs {
@@ -36,6 +37,12 @@ func NewChannel(conn *Conn, optionFuncs ...func(*ChannelOptions)) (*Channel, err
 	if err != nil {
 		_ = chanManager.Close()
 		return nil, fmt.Errorf("declare qos failed: %w", err)
+	}
+	if options.ConfirmMode {
+		if err = chanManager.ConfirmSafe(false); err != nil {
+			_ = chanManager.Close()
+			return nil, fmt.Errorf("declare confirm mode failed: %w", err)
+		}
 	}
 	return &Channel{chanManager}, nil
 }

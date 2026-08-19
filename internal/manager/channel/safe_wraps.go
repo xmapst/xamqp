@@ -2,7 +2,6 @@ package channel
 
 import (
 	"context"
-	"errors"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -174,15 +173,24 @@ func (m *Manager) PublishSafe(
 
 // PublishWithContextSafe 线程安全的带上下文消息发布，支持取消和超时控制。
 //
-// 发布后等待 DeferredConfirmation 完成（若通道处于 confirm 模式），
-// 确保消息确实被 RabbitMQ 服务器接收。若确认失败则返回错误，
-// 调用方可据此决定是否重试。
+// 始终是 fire-and-forget：即使通道处于 confirm 模式，也不在这里等待
+// DeferredConfirmation——确认结果只通过 NotifyPublish 注册的回调异步交付。
+// 若在这里顺带等待确认，confirm 模式一开，Publish/PublishWithContext 就会
+// 从"发出去就返回"退化成每条消息都同步等 broker ack 的往返调用，
+// 且期间还攥着 channelMu 读锁，会拖慢并发重连。需要等待某条消息确认时，
+// 应改用 PublishWithDeferredConfirmWithContextSafe。
+//
+// 使用 lockChannelRead 而非裸 RLock：重连期间写锁被占用时，
+// 调用方传入的 ctx 超时/取消能够中断等待，而不是被无条件阻塞。
 func (m *Manager) PublishWithContextSafe(
 	ctx context.Context, exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing,
 ) error {
-	m.channelMu.RLock()
+	if err := m.lockChannelRead(ctx); err != nil {
+		return err
+	}
 	defer m.channelMu.RUnlock()
-	confirm, err := m.channel.PublishWithDeferredConfirmWithContext(
+
+	return m.channel.PublishWithContext(
 		ctx,
 		exchange,
 		key,
@@ -190,29 +198,18 @@ func (m *Manager) PublishWithContextSafe(
 		immediate,
 		msg,
 	)
-	if err != nil {
-		return err
-	}
-	if confirm != nil {
-		// 等待服务器确认消息已接收（仅在 confirm 模式下 confirm 非 nil）
-		var ok bool
-		ok, err = confirm.WaitContext(ctx)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("message publishing not confirmed")
-		}
-	}
-	return nil
 }
 
 // PublishWithDeferredConfirmWithContextSafe 线程安全的延迟确认消息发布，
 // 返回可稍后等待确认的 DeferredConfirmation 对象。
+//
+// 使用 lockChannelRead 而非裸 RLock，理由同 PublishWithContextSafe。
 func (m *Manager) PublishWithDeferredConfirmWithContextSafe(
 	ctx context.Context, exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing,
 ) (*amqp.DeferredConfirmation, error) {
-	m.channelMu.RLock()
+	if err := m.lockChannelRead(ctx); err != nil {
+		return nil, err
+	}
 	defer m.channelMu.RUnlock()
 
 	return m.channel.PublishWithDeferredConfirmWithContext(
@@ -240,15 +237,22 @@ func (m *Manager) NotifyReturnSafe(
 // ConfirmSafe 线程安全地将通道置于发布确认模式。
 //
 // 使用写锁（非读锁），因为此操作修改通道状态，不应与其他操作并发。
+// 幂等：已经处于 confirm 模式时直接返回 nil，不重复调用底层 Confirm。
+// confirmMode 状态同时被 reconnect() 用来判断是否需要在新通道上重新启用。
 func (m *Manager) ConfirmSafe(
 	noWait bool,
 ) error {
 	m.channelMu.Lock()
 	defer m.channelMu.Unlock()
 
-	return m.channel.Confirm(
-		noWait,
-	)
+	if m.confirmMode {
+		return nil
+	}
+	if err := m.channel.Confirm(noWait); err != nil {
+		return err
+	}
+	m.confirmMode = true
+	return nil
 }
 
 // NotifyPublishSafe 线程安全地注册发布确认事件通道。
@@ -270,7 +274,5 @@ func (m *Manager) NotifyFlowSafe(
 	m.channelMu.RLock()
 	defer m.channelMu.RUnlock()
 
-	return m.channel.NotifyFlow(
-		c,
-	)
+	return m.channel.NotifyFlow(c)
 }

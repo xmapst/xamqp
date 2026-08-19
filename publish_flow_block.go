@@ -56,7 +56,9 @@ func (publisher *Publisher) startNotifyBlockedHandler() {
 // 通过 NotifyBlockedSafe 将接收通道注册到连接管理器的广播列表，
 // 使多个 Publisher 共用同一连接时都能收到阻塞通知。
 func (publisher *Publisher) registerBlockedReceiver() chan amqp.Blocking {
-	blocking := publisher.connManager.NotifyBlockedSafe(make(chan amqp.Blocking))
+	// 容量为 1：配合 connection.Manager 的"非阻塞发送、满了就丢旧值换新值"
+	// 广播策略，保证本 Publisher 最终总能读到最新的阻塞状态。
+	blocking := publisher.connManager.NotifyBlockedSafe(make(chan amqp.Blocking, 1))
 	publisher.disablePublishDueToBlockedMu.Lock()
 	publisher.blocking = blocking // 保存引用，用于 Close() 时从广播列表移除
 	publisher.disablePublishDueToBlocked = false

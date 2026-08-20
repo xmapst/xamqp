@@ -1,7 +1,9 @@
 package channel
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -12,24 +14,32 @@ import (
 	"github.com/xmapst/xamqp/internal/dispatcher"
 )
 
-// spyLogger 记录 Infof 调用内容。reconnectLoop 的每次迭代都会无条件先记一条
-// "waiting ... to attempt to reconnect" 日志，早于它内部 select 着 closeSignal
-// 的等待逻辑，所以这条日志本身就是"reconnectLoop 确实被进入过"的可靠信号，
-// 不需要真的借用一个连接开新通道就能验证 handleCancelOrStateChange 的分支
-// 是否正确。
+// spyLogger 是一个 slog.Handler，记录所有 Info 级别日志的 Message。
+// reconnectLoop 的每次迭代都会无条件先记一条 "waiting to attempt to
+// reconnect" 日志，早于它内部 select 着 closeSignal 的等待逻辑，所以这条
+// 日志本身就是"reconnectLoop 确实被进入过"的可靠信号，不需要真的借用一个
+// 连接开新通道就能验证 handleCancelOrStateChange 的分支是否正确。
+//
+// 通过 slog.SetDefault 安装为进程默认 logger 来捕获生产代码里
+// slog.Info/Warn/Error 包级调用输出的日志。
 type spyLogger struct {
 	mu    sync.Mutex
 	infos []string
 }
 
-func (l *spyLogger) Errorf(string, ...any) {}
-func (l *spyLogger) Warnf(string, ...any)  {}
-func (l *spyLogger) Infof(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.infos = append(l.infos, format)
+func (l *spyLogger) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *spyLogger) Handle(_ context.Context, r slog.Record) error {
+	if r.Level == slog.LevelInfo {
+		l.mu.Lock()
+		l.infos = append(l.infos, r.Message)
+		l.mu.Unlock()
+	}
+	return nil
 }
-func (l *spyLogger) Debugf(string, ...any) {}
+
+func (l *spyLogger) WithAttrs(_ []slog.Attr) slog.Handler { return l }
+func (l *spyLogger) WithGroup(_ string) slog.Handler      { return l }
 
 func (l *spyLogger) hasInfoContaining(substr string) bool {
 	l.mu.Lock()
@@ -40,6 +50,15 @@ func (l *spyLogger) hasInfoContaining(substr string) bool {
 		}
 	}
 	return false
+}
+
+// installSpyLogger 把 spy 设为进程默认 slog logger，并注册测试结束时的
+// 还原，避免污染同一进程内其他测试。
+func installSpyLogger(t *testing.T, spy *spyLogger) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(spy))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 }
 
 // stubNotifyReconnect 是 Manager.notifyConnReconnect 的假实现，供测试直接
@@ -62,8 +81,8 @@ func stubNotifyReconnect() (<-chan error, chan<- struct{}) {
 // 正常捕获并报告为失败，不会拖垮整个测试进程。
 func TestHandleCancelOrStateChange_TransientAndGracefulNeverFallback(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	m := &Manager{
-		logger:     spy,
 		dispatcher: dispatcher.New(),
 	}
 
@@ -94,11 +113,11 @@ func TestHandleCancelOrStateChange_TransientAndGracefulNeverFallback(t *testing.
 // 就绪的分支，才能保证测试完全确定、无需 sleep。
 func TestHandleCancelOrStateChange_ExhaustedRecoveryEntersReconnectLoop(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	closeSignal := make(chan struct{})
 	close(closeSignal)
 
 	m := &Manager{
-		logger:              spy,
 		closeSignal:         closeSignal,
 		reconnectInterval:   time.Hour,
 		dispatcher:          dispatcher.New(),
@@ -121,11 +140,11 @@ func TestHandleCancelOrStateChange_ExhaustedRecoveryEntersReconnectLoop(t *testi
 // xamqp 自己重建整个通道。同样把 reconnectInterval 设得足够大，理由同上。
 func TestHandleCancelOrStateChange_CancelEntersReconnectLoop(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	closeSignal := make(chan struct{})
 	close(closeSignal)
 
 	m := &Manager{
-		logger:              spy,
 		closeSignal:         closeSignal,
 		reconnectInterval:   time.Hour,
 		dispatcher:          dispatcher.New(),
@@ -158,11 +177,11 @@ func TestHandleCancelOrStateChange_CancelEntersReconnectLoop(t *testing.T) {
 // 无法完成，就说明没人在排空，泄漏依然存在。
 func TestHandleCancelOrStateChange_CancelBranchKeepsDrainingStateChannel(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	closeSignal := make(chan struct{})
 	close(closeSignal)
 
 	m := &Manager{
-		logger:              spy,
 		closeSignal:         closeSignal,
 		reconnectInterval:   time.Hour,
 		dispatcher:          dispatcher.New(),
@@ -236,8 +255,8 @@ func TestDrainStateChanges_ExitsWhenChannelClosed(t *testing.T) {
 // 使该分支永不就绪，保证只测这一条路径。
 func TestHandleCancelOrStateChange_StateChannelClosedWithoutTerminalEvent(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	m := &Manager{
-		logger:     spy,
 		dispatcher: dispatcher.New(),
 	}
 
@@ -257,8 +276,8 @@ func TestHandleCancelOrStateChange_StateChannelClosedWithoutTerminalEvent(t *tes
 // reconnectLoop，逻辑继续交给 stateCh 驱动（这里用优雅关闭让函数正常返回）。
 func TestHandleCancelOrStateChange_CancelChannelClosedFallsThroughToState(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	m := &Manager{
-		logger:     spy,
 		dispatcher: dispatcher.New(),
 	}
 

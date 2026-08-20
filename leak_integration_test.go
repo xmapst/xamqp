@@ -18,6 +18,7 @@ package xamqp
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"runtime"
 	"sync"
@@ -40,13 +41,14 @@ func requireExternalBroker(t *testing.T) string {
 	return url
 }
 
-// quietLogger 丢弃全部日志，避免实测输出被重连日志淹没。
-type quietLogger struct{}
-
-func (quietLogger) Errorf(string, ...any) {}
-func (quietLogger) Warnf(string, ...any)  {}
-func (quietLogger) Infof(string, ...any)  {}
-func (quietLogger) Debugf(string, ...any) {}
+// silenceLogging 把进程默认 slog logger 换成 discard，避免实测输出被
+// 重连日志淹没；测试结束时自动还原。
+func silenceLogging(t *testing.T) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+}
 
 // settledGoroutines 等待 goroutine 数量稳定后返回，避免把"还没来得及退出"
 // 误判成"泄漏"。连续 stableFor 个采样点都不再下降就认为已经稳定。
@@ -80,6 +82,7 @@ func settledGoroutines(d time.Duration) int {
 // amqp091-go、进而才可能被关闭。没有 Publisher 时该 channel 永不关闭，
 // 那个 goroutine 就永久卡在 range 上——每建一个 Conn 泄漏一个，Close 也救不回来。
 func TestLeakConsumerOnlyConnLifecycle(t *testing.T) {
+	silenceLogging(t)
 	url := requireExternalBroker(t)
 
 	const cycles = 8
@@ -87,11 +90,11 @@ func TestLeakConsumerOnlyConnLifecycle(t *testing.T) {
 
 	// 预热一轮：首次连接会初始化若干一次性的运行时/库内部 goroutine，
 	// 不预热会把这些一次性开销算进"泄漏"。
-	warm, err := NewConn(url, WithConnectionOptionsLogger(quietLogger{}))
+	warm, err := NewConn(url)
 	if err != nil {
 		t.Fatalf("warmup connect failed: %v", err)
 	}
-	wc, err := NewConsumer(warm, queue, WithConsumerOptionsLogger(quietLogger{}), WithConsumerOptionsQueueDurable)
+	wc, err := NewConsumer(warm, queue, WithConsumerOptionsQueueDurable)
 	if err != nil {
 		t.Fatalf("warmup consumer failed: %v", err)
 	}
@@ -101,12 +104,11 @@ func TestLeakConsumerOnlyConnLifecycle(t *testing.T) {
 	before := settledGoroutines(5 * time.Second)
 
 	for i := range cycles {
-		conn, err := NewConn(url, WithConnectionOptionsLogger(quietLogger{}))
+		conn, err := NewConn(url)
 		if err != nil {
 			t.Fatalf("cycle %d: connect failed: %v", i, err)
 		}
 		consumer, err := NewConsumer(conn, queue,
-			WithConsumerOptionsLogger(quietLogger{}),
 			WithConsumerOptionsQueueDurable,
 		)
 		if err != nil {
@@ -142,13 +144,13 @@ func TestLeakConsumerOnlyConnLifecycle(t *testing.T) {
 // 的投递协程永久卡死（且它后续的 close(ch) 也永远执行不到）——每次 basic.cancel
 // 泄漏一个协程。生产中队列被删、镜像队列主从切换都会触发。
 func TestLeakBasicCancelChannelRebuild(t *testing.T) {
+	silenceLogging(t)
 	url := requireExternalBroker(t)
 
 	const cancels = 6
 	queue := fmt.Sprintf("xamqp_leak_cancel_%d", time.Now().UnixNano())
 
 	conn, err := NewConn(url,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(200*time.Millisecond),
 	)
 	if err != nil {
@@ -157,7 +159,6 @@ func TestLeakBasicCancelChannelRebuild(t *testing.T) {
 	defer conn.Close()
 
 	consumer, err := NewConsumer(conn, queue,
-		WithConsumerOptionsLogger(quietLogger{}),
 		WithConsumerOptionsQueueDurable,
 	)
 	if err != nil {
@@ -217,6 +218,7 @@ func TestLeakBasicCancelChannelRebuild(t *testing.T) {
 // amqp.ErrClosed，对不上——于是每 48 秒重试一次直到进程结束，连带它对连接
 // dispatcher 的订阅和订阅对应的清理协程一起回收不掉。
 func TestLeakConnCloseBeforeChildren(t *testing.T) {
+	silenceLogging(t)
 	url := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_leak_closeorder_%d", time.Now().UnixNano())
@@ -224,14 +226,12 @@ func TestLeakConnCloseBeforeChildren(t *testing.T) {
 	before := settledGoroutines(5 * time.Second)
 
 	conn, err := NewConn(url,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(200*time.Millisecond),
 	)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
 	consumer, err := NewConsumer(conn, queue,
-		WithConsumerOptionsLogger(quietLogger{}),
 		WithConsumerOptionsQueueDurable,
 	)
 	if err != nil {
@@ -267,18 +267,18 @@ func TestLeakConnCloseBeforeChildren(t *testing.T) {
 // isClosed 仍是 false，handlerGoroutine 完全可以取走一条已预取的消息并启动新的
 // handler，于是 Close() 在用户 handler 仍在执行时就返回了。
 func TestGracefulCloseWaitsForInFlightHandler(t *testing.T) {
+	silenceLogging(t)
 	url := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_graceful_%d", time.Now().UnixNano())
 
-	conn, err := NewConn(url, WithConnectionOptionsLogger(quietLogger{}))
+	conn, err := NewConn(url)
 	if err != nil {
 		t.Fatalf("connect failed: %v", err)
 	}
 	defer conn.Close()
 
 	consumer, err := NewConsumer(conn, queue,
-		WithConsumerOptionsLogger(quietLogger{}),
 		WithConsumerOptionsQueueDurable,
 		WithConsumerOptionsQOSPrefetch(50), // 预取多条，制造"关闭时本地还有存货"
 		WithConsumerOptionsConcurrency(16), // 多个 handlerGoroutine 同时抢 msgs，
@@ -320,7 +320,7 @@ func TestGracefulCloseWaitsForInFlightHandler(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond) // 等 basic.consume 真正就绪
 
-	publisher, err := NewPublisher(conn, WithPublisherOptionsLogger(quietLogger{}))
+	publisher, err := NewPublisher(conn)
 	if err != nil {
 		t.Fatalf("publisher failed: %v", err)
 	}
@@ -403,12 +403,12 @@ func TestGracefulCloseWaitsForInFlightHandler(t *testing.T) {
 // 处理两次——Confirmation 携带的 ReconnectionCount 正是用来做消息去重的，
 // 确认本身重复会直接破坏基于它的投递统计。
 func TestPublishConfirmationsNotDuplicatedAcrossReconnect(t *testing.T) {
+	silenceLogging(t)
 	url := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_confirm_dup_%d", time.Now().UnixNano())
 
 	conn, err := NewConn(url,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(200*time.Millisecond),
 	)
 	if err != nil {
@@ -417,7 +417,6 @@ func TestPublishConfirmationsNotDuplicatedAcrossReconnect(t *testing.T) {
 	defer conn.Close()
 
 	publisher, err := NewPublisher(conn,
-		WithPublisherOptionsLogger(quietLogger{}),
 		WithPublisherOptionsConfirm,
 	)
 	if err != nil {

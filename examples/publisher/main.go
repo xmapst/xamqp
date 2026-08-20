@@ -7,7 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"github.com/xmapst/xamqp"
@@ -16,30 +17,31 @@ import (
 func main() {
 	conn, err := xamqp.NewConn(
 		"amqp://guest:guest@localhost:5672/",
-		xamqp.WithConnectionOptionsLogging,
 	)
 	if err != nil {
-		log.Fatalf("failed to connect: %v", err)
+		slog.Error("failed to connect", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer conn.Close()
 
 	publisher, err := xamqp.NewPublisher(
 		conn,
-		xamqp.WithPublisherOptionsLogging,
 		xamqp.WithPublisherOptionsExchangeName("events"),
 		xamqp.WithPublisherOptionsExchangeKind("topic"),
 		xamqp.WithPublisherOptionsExchangeDurable,
 		xamqp.WithPublisherOptionsExchangeDeclare,
 	)
 	if err != nil {
-		log.Fatalf("failed to create publisher: %v", err)
+		slog.Error("failed to create publisher", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher.Close()
 
 	// NotifyReturn fires for messages the broker could not route (relevant
 	// here because we publish with the mandatory flag below).
 	publisher.NotifyReturn(func(r xamqp.Return) {
-		log.Printf("message returned by broker: reply_code=%d reply_text=%s body=%s", r.ReplyCode, r.ReplyText, string(r.Body))
+		slog.Warn("message returned by broker",
+			slog.Any("reply_code", r.ReplyCode), slog.String("reply_text", r.ReplyText), slog.String("body", string(r.Body)))
 	})
 
 	body := fmt.Sprintf(`{"event":"user.signup","email":"user@example.com","ts":%d}`, time.Now().Unix())
@@ -63,15 +65,18 @@ func main() {
 			// alarm such as low disk/memory). Retrying immediately will
 			// just fail again - back off and retry, or surface the
 			// condition to an operator.
-			log.Fatalf("publish blocked by broker (TCP block), back off and retry later: %v", err)
+			slog.Error("publish blocked by broker (TCP block), back off and retry later", slog.Any("error", err))
+			os.Exit(1)
 		case errors.Is(err, xamqp.ErrPublishFlowPaused):
 			// The broker asked us to pause publishing (flow control) due
 			// to high load. This is transient - wait and retry.
-			log.Fatalf("publish paused by broker flow control, retry later: %v", err)
+			slog.Error("publish paused by broker flow control, retry later", slog.Any("error", err))
+			os.Exit(1)
 		default:
-			log.Fatalf("publish failed: %v", err)
+			slog.Error("publish failed", slog.Any("error", err))
+			os.Exit(1)
 		}
 	}
 
-	log.Println("message published successfully")
+	slog.Info("message published successfully")
 }

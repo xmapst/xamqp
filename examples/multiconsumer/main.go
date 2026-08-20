@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -18,11 +18,11 @@ import (
 func main() {
 	conn, err := xamqp.NewConn(
 		"amqp://guest:guest@127.0.0.1:5672/",
-		xamqp.WithConnectionOptionsLogging,
 		xamqp.WithConnectionOptionsReconnectInterval(3*time.Second),
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("connect failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer conn.Close()
 
@@ -38,10 +38,10 @@ func main() {
 		xamqp.WithConsumerOptionsRoutingKey("orders.created"),
 		xamqp.WithConsumerOptionsConcurrency(2),
 		xamqp.WithConsumerOptionsQOSPrefetch(10),
-		xamqp.WithConsumerOptionsLogging,
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("create orders.created consumer failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	cancelledConsumer, err := xamqp.NewConsumer(
@@ -56,10 +56,10 @@ func main() {
 		xamqp.WithConsumerOptionsRoutingKey("orders.cancelled"),
 		xamqp.WithConsumerOptionsConcurrency(2),
 		xamqp.WithConsumerOptionsQOSPrefetch(10),
-		xamqp.WithConsumerOptionsLogging,
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("create orders.cancelled consumer failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	// Run does NOT block: each call returns as soon as its consumer has
@@ -68,27 +68,29 @@ func main() {
 	// keep the process alive on its own (here, by waiting for a shutdown
 	// signal below).
 	err = createdConsumer.Run(func(d xamqp.Delivery) xamqp.Action {
-		log.Printf("[orders.created] received: %s", string(d.Body))
+		slog.Info("received", slog.String("queue", "orders.created"), slog.String("body", string(d.Body)))
 		return xamqp.Ack
 	})
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("orders.created consumer.Run failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
 	err = cancelledConsumer.Run(func(d xamqp.Delivery) xamqp.Action {
-		log.Printf("[orders.cancelled] received: %s", string(d.Body))
+		slog.Info("received", slog.String("queue", "orders.cancelled"), slog.String("body", string(d.Body)))
 		return xamqp.Ack
 	})
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("orders.cancelled consumer.Run failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
-	log.Println("both consumers started, waiting for messages...")
+	slog.Info("both consumers started, waiting for messages...")
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigs
-	log.Printf("received signal %v, shutting down", sig)
+	slog.Info("received signal, shutting down", slog.Any("signal", sig))
 
 	// Close both consumers concurrently, then wait for both to finish
 	// before closing the shared connection.
@@ -105,6 +107,6 @@ func main() {
 	wg.Wait()
 
 	if err := conn.Close(); err != nil {
-		log.Printf("error closing connection: %v", err)
+		slog.Error("error closing connection", slog.Any("error", err))
 	}
 }

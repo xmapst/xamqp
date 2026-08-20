@@ -109,12 +109,12 @@ func (m *managementAPI) killConnections(t *testing.T, nameHint string) int {
 // 通道由底层库原地修复、该计数不再变化，于是它超时失败——失败的是判据，
 // 不是功能。这里改成直接验证功能本身。
 func TestLifecycleChannelErrorRecovery(t *testing.T) {
+	silenceLogging(t)
 	amqpURL := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_lifecycle_chanerr_%d", time.Now().UnixNano())
 
 	conn, err := NewConn(amqpURL,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(200*time.Millisecond),
 	)
 	if err != nil {
@@ -123,7 +123,6 @@ func TestLifecycleChannelErrorRecovery(t *testing.T) {
 	defer conn.Close()
 
 	publisher, err := NewPublisher(conn,
-		WithPublisherOptionsLogger(quietLogger{}),
 		WithPublisherOptionsConfirm,
 	)
 	if err != nil {
@@ -187,13 +186,13 @@ func TestLifecycleChannelErrorRecovery(t *testing.T) {
 // 这是最能代表"生命周期是否被破坏"的用例：它同时覆盖连接层恢复、通道层
 // 重建、消费者重新订阅、以及重连之后拓扑是否还在。
 func TestLifecycleConnectionDropRecovery(t *testing.T) {
+	silenceLogging(t)
 	amqpURL := requireExternalBroker(t)
 	mgmt := newManagementAPI(t, amqpURL)
 
 	queue := fmt.Sprintf("xamqp_lifecycle_drop_%d", time.Now().UnixNano())
 
 	conn, err := NewConn(amqpURL,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(300*time.Millisecond),
 	)
 	if err != nil {
@@ -203,7 +202,6 @@ func TestLifecycleConnectionDropRecovery(t *testing.T) {
 
 	received := make(chan string, 256)
 	consumer, err := NewConsumer(conn, queue,
-		WithConsumerOptionsLogger(quietLogger{}),
 		WithConsumerOptionsQueueDurable,
 	)
 	if err != nil {
@@ -221,7 +219,7 @@ func TestLifecycleConnectionDropRecovery(t *testing.T) {
 		t.Fatalf("run failed: %v", err)
 	}
 
-	publisher, err := NewPublisher(conn, WithPublisherOptionsLogger(quietLogger{}))
+	publisher, err := NewPublisher(conn)
 	if err != nil {
 		t.Fatalf("publisher failed: %v", err)
 	}
@@ -260,12 +258,12 @@ func TestLifecycleConnectionDropRecovery(t *testing.T) {
 //
 // 这条路径正是本次加了排空协程的那个分支，必须确认修复没有把恢复本身弄坏。
 func TestLifecycleQueueDeletedRecovery(t *testing.T) {
+	silenceLogging(t)
 	amqpURL := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_lifecycle_qdel_%d", time.Now().UnixNano())
 
 	conn, err := NewConn(amqpURL,
-		WithConnectionOptionsLogger(quietLogger{}),
 		WithConnectionOptionsReconnectInterval(300*time.Millisecond),
 	)
 	if err != nil {
@@ -275,7 +273,6 @@ func TestLifecycleQueueDeletedRecovery(t *testing.T) {
 
 	received := make(chan string, 256)
 	consumer, err := NewConsumer(conn, queue,
-		WithConsumerOptionsLogger(quietLogger{}),
 		WithConsumerOptionsQueueDurable,
 	)
 	if err != nil {
@@ -293,7 +290,7 @@ func TestLifecycleQueueDeletedRecovery(t *testing.T) {
 		t.Fatalf("run failed: %v", err)
 	}
 
-	publisher, err := NewPublisher(conn, WithPublisherOptionsLogger(quietLogger{}))
+	publisher, err := NewPublisher(conn)
 	if err != nil {
 		t.Fatalf("publisher failed: %v", err)
 	}

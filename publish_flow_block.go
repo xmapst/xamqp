@@ -1,6 +1,10 @@
 package xamqp
 
-import amqp "github.com/rabbitmq/amqp091-go"
+import (
+	"log/slog"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+)
 
 // startNotifyFlowHandler 监听 RabbitMQ 服务器的 Flow 控制信号，实现自动流量控制。
 //
@@ -20,12 +24,12 @@ func (publisher *Publisher) startNotifyFlowHandler() {
 		publisher.disablePublishDueToFlowMu.Lock()
 		if ok {
 			// ok=true 表示服务器请求暂停发布（Flow 激活）
-			publisher.options.Logger.Warnf("pausing publishing due to flow request from server")
+			slog.Warn("pausing publishing due to flow request from server")
 			publisher.disablePublishDueToFlow = true
 		} else {
 			// ok=false 表示服务器允许恢复发布（Flow 解除）
 			publisher.disablePublishDueToFlow = false
-			publisher.options.Logger.Warnf("resuming publishing due to flow request from server")
+			slog.Warn("resuming publishing due to flow request from server")
 		}
 		publisher.disablePublishDueToFlowMu.Unlock()
 	}
@@ -71,11 +75,11 @@ func (publisher *Publisher) readBlockedNotifications(blocking chan amqp.Blocking
 	for b := range blocking {
 		publisher.disablePublishDueToBlockedMu.Lock()
 		if b.Active {
-			publisher.options.Logger.Warnf("pausing publishing due to TCP blocking from server")
+			slog.Warn("pausing publishing due to TCP blocking from server")
 			publisher.disablePublishDueToBlocked = true
 		} else {
 			publisher.disablePublishDueToBlocked = false
-			publisher.options.Logger.Warnf("resuming publishing due to TCP blocking from server")
+			slog.Warn("resuming publishing due to TCP blocking from server")
 		}
 		publisher.disablePublishDueToBlockedMu.Unlock()
 	}

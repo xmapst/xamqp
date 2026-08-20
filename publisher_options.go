@@ -9,7 +9,6 @@ import (
 // PublisherOptions 发布者配置选项，描述 Publisher 的创建参数。
 type PublisherOptions struct {
 	ExchangeOptions ExchangeOptions // 关联的交换机声明参数
-	Logger          ILogger         // 自定义日志实现
 	ConfirmMode     bool            // 是否启用发布确认模式
 }
 
@@ -27,20 +26,7 @@ func getDefaultPublisherOptions() PublisherOptions {
 			Args:       make(amqp.Table),
 			Declare:    false,
 		},
-		Logger:      stdDebugLogger{},
 		ConfirmMode: false,
-	}
-}
-
-// WithPublisherOptionsLogging 使用默认日志（输出到标准输出）。
-func WithPublisherOptionsLogging(options *PublisherOptions) {
-	options.Logger = &stdDebugLogger{}
-}
-
-// WithPublisherOptionsLogger 设置自定义日志实现。
-func WithPublisherOptionsLogger(log ILogger) func(options *PublisherOptions) {
-	return func(options *PublisherOptions) {
-		options.Logger = log
 	}
 }
 

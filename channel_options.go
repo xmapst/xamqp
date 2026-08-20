@@ -2,16 +2,14 @@ package xamqp
 
 // ChannelOptions 通道配置选项，描述 Channel 的创建参数。
 type ChannelOptions struct {
-	Logger      ILogger // 自定义日志实现
-	QOSPrefetch int     // 消息预取数量
-	QOSGlobal   bool    // 是否对连接内所有通道全局生效
-	ConfirmMode bool    // 是否启用发布确认模式
+	QOSPrefetch int  // 消息预取数量
+	QOSGlobal   bool // 是否对连接内所有通道全局生效
+	ConfirmMode bool // 是否启用发布确认模式
 }
 
 // getDefaultChannelOptions 返回通道选项的默认值。
 func getDefaultChannelOptions() ChannelOptions {
 	return ChannelOptions{
-		Logger:      stdDebugLogger{},
 		QOSPrefetch: 10,
 		QOSGlobal:   false,
 	}
@@ -33,18 +31,6 @@ func WithChannelOptionsQOSPrefetch(prefetchCount int) func(*ChannelOptions) {
 // 非全局模式（默认）仅影响当前通道。
 func WithChannelOptionsQOSGlobal(options *ChannelOptions) {
 	options.QOSGlobal = true
-}
-
-// WithChannelOptionsLogging 使用默认日志（输出到标准输出）。
-func WithChannelOptionsLogging(options *ChannelOptions) {
-	options.Logger = &stdDebugLogger{}
-}
-
-// WithChannelOptionsLogger 设置自定义日志实现。
-func WithChannelOptionsLogger(log ILogger) func(options *ChannelOptions) {
-	return func(options *ChannelOptions) {
-		options.Logger = log
-	}
 }
 
 // WithChannelOptionsConfirm 开启发布确认模式（Confirm Mode）。

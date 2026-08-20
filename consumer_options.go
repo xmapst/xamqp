@@ -31,7 +31,6 @@ func getDefaultConsumerOptions(queueName string) ConsumerOptions {
 		ExchangeOptions: []ExchangeOptions{},
 		Concurrency:     1,
 		CloseGracefully: true,
-		Logger:          stdDebugLogger{},
 		QOSPrefetch:     10,
 		QOSGlobal:       false,
 	}
@@ -73,7 +72,6 @@ type ConsumerOptions struct {
 	CloseGracefully       bool                  // 关闭时是否等待当前消息处理完成
 	ExchangeOptions       []ExchangeOptions     // 关联的交换机声明参数列表
 	Concurrency           int                   // 并发消费 goroutine 数量
-	Logger                ILogger               // 自定义日志实现
 	QOSPrefetch           int                   // QoS 预取数量
 	QOSGlobal             bool                  // QoS 是否全局生效
 }
@@ -311,18 +309,6 @@ func WithConsumerOptionsConsumerExclusive(options *ConsumerOptions) {
 // 不等待时立即开始接收消息，若服务器无法满足请求则通道关闭并返回错误。
 func WithConsumerOptionsConsumerNoWait(options *ConsumerOptions) {
 	options.RabbitConsumerOptions.NoWait = true
-}
-
-// WithConsumerOptionsLogging 使用默认日志（输出到标准输出）。
-func WithConsumerOptionsLogging(options *ConsumerOptions) {
-	options.Logger = &stdDebugLogger{}
-}
-
-// WithConsumerOptionsLogger 设置自定义日志实现。
-func WithConsumerOptionsLogger(log ILogger) func(options *ConsumerOptions) {
-	return func(options *ConsumerOptions) {
-		options.Logger = log
-	}
 }
 
 // WithConsumerOptionsQOSPrefetch 设置 QoS 预取数量。

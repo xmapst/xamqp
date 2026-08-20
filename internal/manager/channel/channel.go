@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -11,7 +12,6 @@ import (
 
 	"github.com/xmapst/xamqp/internal/backoff"
 	"github.com/xmapst/xamqp/internal/dispatcher"
-	"github.com/xmapst/xamqp/internal/logger"
 	"github.com/xmapst/xamqp/internal/manager/connection"
 )
 
@@ -26,7 +26,6 @@ import (
 //   - 写操作（reconnect/Close）持有写锁，独占访问
 //   - reconnectionCountMu 单独保护重连计数，避免与 channelMu 产生锁竞争
 type Manager struct {
-	logger              logger.ILogger         // 日志实现
 	channel             *amqp.Channel          // 底层 AMQP 通道，受 channelMu 保护
 	connManager         *connection.Manager    // 所属的连接管理器，重连时用于借用连接开新通道
 	channelMu           *sync.RWMutex          // 读写锁：允许多读单写
@@ -50,9 +49,8 @@ type Manager struct {
 var errClosed = errors.New("channel manager is closed")
 
 // New 创建通道管理器，初始化时立即建立 AMQP 通道并启动异常监听。
-func New(connManager *connection.Manager, log logger.ILogger, reconnectInterval time.Duration) (*Manager, error) {
+func New(connManager *connection.Manager, reconnectInterval time.Duration) (*Manager, error) {
 	chanManager := &Manager{
-		logger:              log,
 		connManager:         connManager,
 		channelMu:           &sync.RWMutex{},
 		closeSignal:         make(chan struct{}),
@@ -136,11 +134,11 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			// StateClosed 后库会关闭它），让那个投递协程能够跑完并退出。
 			go m.drainStateChanges(stateCh)
 
-			m.logger.Errorf("attempting to reconnect to amqp server after cancel with error: %s", tag)
+			slog.Error("attempting to reconnect to amqp server after cancel", slog.String("tag", tag))
 			m.reconnectLoop()
-			m.logger.Warnf("successfully reconnected to amqp server after cancel")
+			slog.Warn("successfully reconnected to amqp server after cancel")
 			if err := m.dispatcher.Dispatch(errors.New(tag)); err != nil {
-				m.logger.Warnf("channel dispatch err: %v", err)
+				slog.Warn("channel dispatch error", slog.Any("error", err))
 			}
 			return
 		case sc, ok := <-stateCh:
@@ -149,17 +147,17 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			}
 			switch sc.To {
 			case amqp.StateReconnecting:
-				m.logger.Warnf("amqp channel lost, native recovery in progress")
+				slog.Warn("amqp channel lost, native recovery in progress")
 			case amqp.StateOpen:
-				m.logger.Infof("amqp channel recovered by native recovery")
+				slog.Info("amqp channel recovered by native recovery")
 			case amqp.StateClosed:
 				if sc.Err != nil {
-					m.logger.Errorf("native recovery exhausted, falling back to full channel rebuild: %v", sc.Err)
+					slog.Error("native recovery exhausted, falling back to full channel rebuild", slog.Any("error", sc.Err))
 					m.reconnectLoop()
-					m.logger.Warnf("successfully reconnected to amqp server")
+					slog.Warn("successfully reconnected to amqp server")
 					_ = m.dispatcher.Dispatch(sc.Err)
 				} else {
-					m.logger.Infof("amqp channel closed gracefully")
+					slog.Info("amqp channel closed gracefully")
 				}
 				return
 			default:
@@ -223,20 +221,20 @@ func (m *Manager) reconnectLoop() {
 
 	for {
 		delay := backoff.Delay(m.reconnectInterval, attempt)
-		m.logger.Infof("waiting %s to attempt to reconnect to amqp server", delay)
+		slog.Info("waiting to attempt to reconnect to amqp server", slog.Duration("delay", delay))
 		select {
 		case <-m.closeSignal:
-			m.logger.Infof("channel manager closed, stopping reconnect loop")
+			slog.Info("channel manager closed, stopping reconnect loop")
 			return
 		case <-connReconnected:
-			m.logger.Infof("underlying connection recovered, retrying immediately instead of waiting out the backoff")
+			slog.Info("underlying connection recovered, retrying immediately instead of waiting out the backoff")
 		case <-time.After(delay):
 		}
 
 		err := m.reconnect()
 		if err != nil {
 			if errors.Is(err, errClosed) {
-				m.logger.Infof("channel manager closed, stopping reconnect loop")
+				slog.Info("channel manager closed, stopping reconnect loop")
 				return
 			}
 			// 所属连接管理器已经被 Close：这不是可以靠重试恢复的瞬时错误，
@@ -248,10 +246,10 @@ func (m *Manager) reconnectLoop() {
 			// 自己的 Close() 才会关闭。用户先关 Conn 再关 Consumer/Publisher
 			// （README 建议反过来，但没有强制）就会命中这条路径。
 			if m.connManager.IsClosed() {
-				m.logger.Infof("connection manager is closed, stopping channel reconnect loop")
+				slog.Info("connection manager is closed, stopping channel reconnect loop")
 				return
 			}
-			m.logger.Errorf("error reconnecting to amqp server: %v", err)
+			slog.Error("error reconnecting to amqp server", slog.Any("error", err))
 			attempt++
 		} else {
 			// 重连计数已在 reconnect() 内与通道装入原子地一起递增，此处不再重复递增。
@@ -288,7 +286,7 @@ func (m *Manager) reconnect() error {
 	if m.closed {
 		m.channelMu.Unlock()
 		if cerr := newChannel.Close(); cerr != nil {
-			m.logger.Warnf("error closing redundant channel after manager was closed: %v", cerr)
+			slog.Warn("error closing redundant channel after manager was closed", slog.Any("error", cerr))
 		}
 		return errClosed
 	}
@@ -297,7 +295,7 @@ func (m *Manager) reconnect() error {
 		if cerr := newChannel.Confirm(false); cerr != nil {
 			m.channelMu.Unlock()
 			if cerr2 := newChannel.Close(); cerr2 != nil {
-				m.logger.Warnf("error closing channel after failed confirm re-arm: %v", cerr2)
+				slog.Warn("error closing channel after failed confirm re-arm", slog.Any("error", cerr2))
 			}
 			return fmt.Errorf("failed to re-arm confirm mode after reconnect: %w", cerr)
 		}
@@ -317,7 +315,7 @@ func (m *Manager) reconnect() error {
 	// 先建立新通道，再关闭旧通道，防止期间有操作无通道可用
 	if oldChannel != nil {
 		if err = oldChannel.Close(); err != nil {
-			m.logger.Warnf("error closing channel while reconnecting: %v", err)
+			slog.Warn("error closing channel while reconnecting", slog.Any("error", err))
 		}
 	}
 	return nil
@@ -338,10 +336,10 @@ func (m *Manager) Close() error {
 	m.closed = true
 	close(m.closeSignal)
 
-	m.logger.Infof("closing channel manager...")
+	slog.Info("closing channel manager...")
 	err := m.channel.Close()
 	if err != nil {
-		m.logger.Errorf("close err: %v", err)
+		slog.Error("close error", slog.Any("error", err))
 		return err
 	}
 

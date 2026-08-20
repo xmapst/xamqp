@@ -8,14 +8,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// noopLogger 供测试直接构造 Manager 时使用，避免依赖真实的日志实现。
-type noopLogger struct{}
-
-func (noopLogger) Errorf(string, ...any) {}
-func (noopLogger) Warnf(string, ...any)  {}
-func (noopLogger) Infof(string, ...any)  {}
-func (noopLogger) Debugf(string, ...any) {}
-
 // newTestManager 构造一个不依赖真实 AMQP 连接的最小 Manager，
 // 专用于测试 publisherNotifyBlockingReceivers 相关逻辑。
 //
@@ -24,7 +16,6 @@ func (noopLogger) Debugf(string, ...any) {}
 // 的分支，从而不需要一个真正拨号成功的 m.connection。
 func newTestManager() *Manager {
 	return &Manager{
-		logger:                              noopLogger{},
 		connectionMu:                        &sync.RWMutex{},
 		publisherNotifyBlockingReceiversMu:  &sync.RWMutex{},
 		universalNotifyBlockingReceiverUsed: true,

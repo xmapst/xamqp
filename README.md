@@ -549,15 +549,12 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 字段：
 
 - [`ReconnectInterval`](connection_options.go:9)：重连退避的初始等待时间
-- [`Logger`](connection_options.go:10)：自定义日志实现
-- [`Config`](connection_options.go:11)：AMQP 连接协商参数
+- [`Config`](connection_options.go:10)：AMQP 连接协商参数
 
 可选函数：
 
-- [`WithConnectionOptionsReconnectInterval()`](connection_options.go:26)
-- [`WithConnectionOptionsLogging()`](connection_options.go:33)
-- [`WithConnectionOptionsLogger()`](connection_options.go:38)
-- [`WithConnectionOptionsConfig()`](connection_options.go:47)
+- [`WithConnectionOptionsReconnectInterval()`](connection_options.go:20)
+- [`WithConnectionOptionsConfig()`](connection_options.go:33)
 
 ---
 
@@ -567,18 +564,15 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 
 字段：
 
-- [`Logger`](channel_options.go:5)
-- [`QOSPrefetch`](channel_options.go:6)
-- [`QOSGlobal`](channel_options.go:7)
-- [`ConfirmMode`](channel_options.go:8)
+- [`QOSPrefetch`](channel_options.go:5)
+- [`QOSGlobal`](channel_options.go:6)
+- [`ConfirmMode`](channel_options.go:7)
 
 可选函数：
 
-- [`WithChannelOptionsQOSPrefetch()`](channel_options.go:24)
-- [`WithChannelOptionsQOSGlobal()`](channel_options.go:34)
-- [`WithChannelOptionsLogging()`](channel_options.go:39)
-- [`WithChannelOptionsLogger()`](channel_options.go:44)
-- [`WithChannelOptionsConfirm()`](channel_options.go:54)
+- [`WithChannelOptionsQOSPrefetch()`](channel_options.go:22)
+- [`WithChannelOptionsQOSGlobal()`](channel_options.go:32)
+- [`WithChannelOptionsConfirm()`](channel_options.go:40)
 
 说明：[`ChannelOptions.ConfirmMode`](channel_options.go:8) 会在 [`NewChannel()`](channel.go:23) 中实际启用确认模式（失败则创建返回错误）；但 `Channel` 是底层原语封装，不像 `Publisher` 那样在重连后自动重新声明拓扑、重新注册确认回调，多数场景仍建议优先使用 [`Publisher`](publish.go:64)。
 
@@ -594,10 +588,9 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 - [`QueueOptions`](consumer_options.go:72)：队列声明参数
 - [`CloseGracefully`](consumer_options.go:73)：是否优雅关闭
 - [`ExchangeOptions`](consumer_options.go:74)：交换机及绑定声明配置
-- [`Concurrency`](consumer_options.go:75)：并发处理数
-- [`Logger`](consumer_options.go:76)
-- [`QOSPrefetch`](consumer_options.go:77)
-- [`QOSGlobal`](consumer_options.go:78)
+- [`Concurrency`](consumer_options.go:74)：并发处理数
+- [`QOSPrefetch`](consumer_options.go:75)
+- [`QOSGlobal`](consumer_options.go:76)
 
 ### 队列相关选项
 
@@ -636,13 +629,11 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 - [`WithConsumerOptionsConsumerName()`](consumer_options.go:285)
 - [`WithConsumerOptionsConsumerAutoAck()`](consumer_options.go:295)
 - [`WithConsumerOptionsConsumerExclusive()`](consumer_options.go:305)
-- [`WithConsumerOptionsConsumerNoWait()`](consumer_options.go:312)
-- [`WithConsumerOptionsLogging()`](consumer_options.go:317)
-- [`WithConsumerOptionsLogger()`](consumer_options.go:322)
-- [`WithConsumerOptionsQOSPrefetch()`](consumer_options.go:332)
-- [`WithConsumerOptionsQOSGlobal()`](consumer_options.go:339)
-- [`WithConsumerOptionsForceShutdown()`](consumer_options.go:347)
-- [`WithConsumerStreamOffset()`](consumer_options.go:380)
+- [`WithConsumerOptionsConsumerNoWait()`](consumer_options.go:310)
+- [`WithConsumerOptionsQOSPrefetch()`](consumer_options.go:318)
+- [`WithConsumerOptionsQOSGlobal()`](consumer_options.go:325)
+- [`WithConsumerOptionsForceShutdown()`](consumer_options.go:333)
+- [`WithConsumerStreamOffset()`](consumer_options.go:366)
 
 ### 消费者默认值
 
@@ -664,25 +655,22 @@ if errors.Is(err, xamqp.ErrPublishFlowPaused) || errors.Is(err, xamqp.ErrPublish
 字段：
 
 - [`ExchangeOptions`](publisher_options.go:11)
-- [`Logger`](publisher_options.go:12)
-- [`ConfirmMode`](publisher_options.go:13)
+- [`ConfirmMode`](publisher_options.go:12)
 
 可选函数：
 
-- [`WithPublisherOptionsLogging()`](publisher_options.go:36)
-- [`WithPublisherOptionsLogger()`](publisher_options.go:41)
-- [`WithPublisherOptionsExchangeName()`](publisher_options.go:48)
-- [`WithPublisherOptionsExchangeKind()`](publisher_options.go:55)
-- [`WithPublisherOptionsExchangeDurable()`](publisher_options.go:62)
-- [`WithPublisherOptionsExchangeAutoDelete()`](publisher_options.go:67)
-- [`WithPublisherOptionsExchangeInternal()`](publisher_options.go:72)
-- [`WithPublisherOptionsExchangeNoWait()`](publisher_options.go:77)
-- [`WithPublisherOptionsExchangeDeclare()`](publisher_options.go:82)
-- [`WithPublisherOptionsExchangePassive()`](publisher_options.go:87)
-- [`WithPublisherOptionsExchangeArgs()`](publisher_options.go:92)
-- [`WithPublisherOptionsConfirm()`](publisher_options.go:105)
+- [`WithPublisherOptionsExchangeName()`](publisher_options.go:34)
+- [`WithPublisherOptionsExchangeKind()`](publisher_options.go:41)
+- [`WithPublisherOptionsExchangeDurable()`](publisher_options.go:48)
+- [`WithPublisherOptionsExchangeAutoDelete()`](publisher_options.go:53)
+- [`WithPublisherOptionsExchangeInternal()`](publisher_options.go:58)
+- [`WithPublisherOptionsExchangeNoWait()`](publisher_options.go:63)
+- [`WithPublisherOptionsExchangeDeclare()`](publisher_options.go:68)
+- [`WithPublisherOptionsExchangePassive()`](publisher_options.go:73)
+- [`WithPublisherOptionsExchangeArgs()`](publisher_options.go:78)
+- [`WithPublisherOptionsConfirm()`](publisher_options.go:91)
 
-默认值见 [`getDefaultPublisherOptions()`](publisher_options.go:17)：
+默认值见 [`getDefaultPublisherOptions()`](publisher_options.go:16)：
 
 - 默认交换机类型为 `direct`
 - 默认不声明交换机
@@ -811,26 +799,17 @@ func(d xamqp.Delivery) xamqp.Action
 
 ## 日志
 
-对外日志接口为 [`ILogger`](logger.go:14)，可通过多种 `With*Logger()` 选项注入。
+xamqp 没有自定义的日志接口或注入点，直接通过 Go 标准库的 [`log/slog`](https://pkg.go.dev/log/slog) 包记录日志（`slog.Info`/`slog.Warn`/`slog.Error`），写入进程级别的 `slog.Default()`。
 
-默认实现为 [`stdDebugLogger`](logger.go:23)，基于 Go 标准库 `log` 输出，格式类似：
+要自定义输出格式、目的地、最低级别或附加字段，在创建任何 `Conn`/`Publisher`/`Consumer` 之前调用 `slog.SetDefault()` 替换进程默认 logger 即可，xamqp 会自动读取，无需按组件逐个注入：
 
-```text
-gorabbit INFO: successful consumer recovery
-gorabbit WARN: pausing publishing due to flow request from server
+```go
+slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+})))
 ```
 
-可注入的位置包括：
-
-- [`WithConnectionOptionsLogger()`](connection_options.go:38)
-- [`WithChannelOptionsLogger()`](channel_options.go:44)
-- [`WithDeclareOptionsLogger()`](declare_options.go:23)
-- [`WithConsumerOptionsLogger()`](consumer_options.go:322)
-- [`WithPublisherOptionsLogger()`](publisher_options.go:41)
-
-建议在生产环境中接入业务统一日志系统，便于关联链路、监控和告警。
-
-注意：`ILogger` 只有 `Errorf`/`Warnf`/`Infof`/`Debugf` 四个方法，没有 `Fatalf`。
+xamqp 从不调用 `os.Exit`/`panic`，因此也不涉及 Fatal 级别日志。
 
 ---
 
@@ -843,7 +822,7 @@ gorabbit WARN: pausing publishing due to flow request from server
 - [`examples/publisher_confirm`](examples/publisher_confirm/main.go)：对比 `NotifyPublish` 异步确认与 `PublishWithDeferredConfirmWithContext` 同步等待两种确认方式
 - [`examples/multiconsumer`](examples/multiconsumer/main.go)：同一个 `Conn` 下运行多个独立 `Consumer`
 - [`examples/multipublisher`](examples/multipublisher/main.go)：定时发布循环，配合信号实现优雅关闭
-- [`examples/logger`](examples/logger/main.go)：实现自定义 `ILogger` 并注入
+- [`examples/logger`](examples/logger/main.go)：通过 `slog.SetDefault()` 自定义 xamqp 的日志输出
 
 运行前需要一个可访问的 RabbitMQ 实例（默认 `amqp://guest:guest@127.0.0.1:5672/`）。
 

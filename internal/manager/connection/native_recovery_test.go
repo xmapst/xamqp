@@ -1,7 +1,9 @@
 package connection
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -12,23 +14,32 @@ import (
 	"github.com/xmapst/xamqp/internal/dispatcher"
 )
 
-// spyLogger 记录 Infof 调用内容。reconnectLoop 的每次迭代都会无条件先记一条
-// "waiting ... to attempt to reconnect" 日志，早于它内部 select 着 closeSignal
-// 的等待逻辑，所以这条日志本身就是"reconnectLoop 确实被进入过"的可靠信号，
-// 不需要真的建立/拨号一个连接就能验证 handleStateChanges 的分支是否正确。
+// spyLogger 是一个 slog.Handler，记录所有 Info 级别日志的 Message。
+// reconnectLoop 的每次迭代都会无条件先记一条 "waiting to attempt to
+// reconnect" 日志，早于它内部 select 着 closeSignal 的等待逻辑，所以这条
+// 日志本身就是"reconnectLoop 确实被进入过"的可靠信号，不需要真的建立/拨号
+// 一个连接就能验证 handleStateChanges 的分支是否正确。
+//
+// 通过 slog.SetDefault 安装为进程默认 logger 来捕获生产代码里
+// slog.Info/Warn/Error 包级调用输出的日志。
 type spyLogger struct {
 	mu    sync.Mutex
 	infos []string
 }
 
-func (l *spyLogger) Errorf(string, ...any) {}
-func (l *spyLogger) Warnf(string, ...any)  {}
-func (l *spyLogger) Infof(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.infos = append(l.infos, format)
+func (l *spyLogger) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *spyLogger) Handle(_ context.Context, r slog.Record) error {
+	if r.Level == slog.LevelInfo {
+		l.mu.Lock()
+		l.infos = append(l.infos, r.Message)
+		l.mu.Unlock()
+	}
+	return nil
 }
-func (l *spyLogger) Debugf(string, ...any) {}
+
+func (l *spyLogger) WithAttrs(_ []slog.Attr) slog.Handler { return l }
+func (l *spyLogger) WithGroup(_ string) slog.Handler      { return l }
 
 func (l *spyLogger) hasInfoContaining(substr string) bool {
 	l.mu.Lock()
@@ -39,6 +50,15 @@ func (l *spyLogger) hasInfoContaining(substr string) bool {
 		}
 	}
 	return false
+}
+
+// installSpyLogger 把 spy 设为进程默认 slog logger，并注册测试结束时的
+// 还原，避免污染同一进程内其他测试。
+func installSpyLogger(t *testing.T, spy *spyLogger) {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(spy))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 }
 
 // TestHandleStateChanges_TransientAndGracefulNeverFallback 验证中间态
@@ -54,11 +74,11 @@ func (l *spyLogger) hasInfoContaining(substr string) bool {
 // hasInfoContaining("waiting") 检查。
 func TestHandleStateChanges_TransientAndGracefulNeverFallback(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	closeSignal := make(chan struct{})
 	close(closeSignal)
 
 	m := &Manager{
-		logger:      spy,
 		closeSignal: closeSignal,
 		dispatcher:  dispatcher.New(),
 	}
@@ -90,11 +110,11 @@ func TestHandleStateChanges_TransientAndGracefulNeverFallback(t *testing.T) {
 // 就绪的分支，才能保证测试完全确定、无需 sleep。
 func TestHandleStateChanges_ExhaustedRecoveryEntersReconnectLoop(t *testing.T) {
 	spy := &spyLogger{}
+	installSpyLogger(t, spy)
 	closeSignal := make(chan struct{})
 	close(closeSignal)
 
 	m := &Manager{
-		logger:            spy,
 		closeSignal:       closeSignal,
 		ReconnectInterval: time.Hour,
 		dispatcher:        dispatcher.New(),

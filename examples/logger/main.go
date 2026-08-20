@@ -1,19 +1,17 @@
-// Command logger demonstrates how to plug a custom logging backend into xamqp.
+// Command logger demonstrates xamqp's logging behavior.
 //
-// xamqp.ILogger is a small 4-method interface (Errorf/Warnf/Infof/Debugf).
-// Unlike upstream go-rabbitmq's Logger interface, it does NOT have a Fatalf
-// method — xamqp never calls os.Exit/panic on your behalf, so your logger
-// implementation doesn't need to provide one either.
-//
-// Every component that talks to the broker (Conn, Publisher, Consumer,
-// Channel, Declarator) accepts its own logger via a WithXxxOptionsLogger
-// option, so you can inject a different logger per component or reuse the
-// same instance everywhere, as this example does.
+// xamqp has no custom logging interface: it logs directly through the
+// standard library's log/slog package (slog.Info/Warn/Error/Debug), writing
+// to slog.Default(). To customize the output - format, destination, minimum
+// level, extra attributes - configure the process-wide default logger with
+// slog.SetDefault before creating any xamqp Conn/Publisher/Consumer; xamqp
+// picks it up automatically, with no per-component injection needed.
 package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -21,72 +19,41 @@ import (
 	"github.com/xmapst/xamqp"
 )
 
-// prefixLogger is a minimal custom logger backend that implements
-// xamqp.ILogger by wrapping the standard library "log" package and adding a
-// level + component prefix to every line. A real application would typically
-// forward these calls into its own structured logger (zap, slog, zerolog...)
-// instead.
-type prefixLogger struct {
-	prefix string
-}
-
-// Errorf implements xamqp.ILogger.
-func (l *prefixLogger) Errorf(format string, args ...any) {
-	log.Printf("["+l.prefix+"] ERROR: "+format, args...)
-}
-
-// Warnf implements xamqp.ILogger.
-func (l *prefixLogger) Warnf(format string, args ...any) {
-	log.Printf("["+l.prefix+"] WARN: "+format, args...)
-}
-
-// Infof implements xamqp.ILogger.
-func (l *prefixLogger) Infof(format string, args ...any) {
-	log.Printf("["+l.prefix+"] INFO: "+format, args...)
-}
-
-// Debugf implements xamqp.ILogger.
-func (l *prefixLogger) Debugf(format string, args ...any) {
-	log.Printf("["+l.prefix+"] DEBUG: "+format, args...)
-}
-
 func main() {
-	myLogger := &prefixLogger{prefix: "myapp"}
+	// Replace the process-wide default slog logger. Here: JSON output to
+	// stdout, debug level enabled, with a fixed "component" attribute so log
+	// lines from xamqp can be distinguished from the rest of the app.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})).With(slog.String("component", "myapp")))
 
-	// Injection point #1: the connection. This logger receives connection
-	// level events such as dial attempts, reconnects and shutdown.
-	conn, err := xamqp.NewConn(
-		"amqp://guest:guest@localhost",
-		xamqp.WithConnectionOptionsLogger(myLogger),
-	)
+	conn, err := xamqp.NewConn("amqp://guest:guest@localhost")
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("connect failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			myLogger.Errorf("close connection: %v", err)
+			slog.Error("close connection", slog.Any("error", err))
 		}
 	}()
 
-	// Injection point #2: the publisher. Components created from the same
-	// Conn can each be given their own logger; here we simply reuse myLogger.
 	publisher, err := xamqp.NewPublisher(
 		conn,
-		xamqp.WithPublisherOptionsLogger(myLogger),
 		xamqp.WithPublisherOptionsExchangeName("events"),
 		xamqp.WithPublisherOptionsExchangeKind(amqp.ExchangeTopic),
 		xamqp.WithPublisherOptionsExchangeDurable,
 		xamqp.WithPublisherOptionsExchangeDeclare,
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("create publisher failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher.Close()
 
-	// Returned (unroutable) messages are reported through NotifyReturn; route
-	// that straight through our custom logger too.
+	// Returned (unroutable) messages are reported through NotifyReturn.
 	publisher.NotifyReturn(func(r xamqp.Return) {
-		myLogger.Warnf("message returned from server: %s", string(r.Body))
+		slog.Warn("message returned from server", slog.String("body", string(r.Body)))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -100,15 +67,12 @@ func main() {
 		xamqp.WithPublishOptionsPersistentDelivery,
 		xamqp.WithPublishOptionsExchange("events"),
 	); err != nil {
-		myLogger.Errorf("publish failed: %v", err)
+		slog.Error("publish failed", slog.Any("error", err))
 	}
 
-	// Injection point #3: the consumer. Same idea — pass the logger through
-	// WithConsumerOptionsLogger.
 	consumer, err := xamqp.NewConsumer(
 		conn,
 		"my_queue",
-		xamqp.WithConsumerOptionsLogger(myLogger),
 		xamqp.WithConsumerOptionsExchangeName("events"),
 		xamqp.WithConsumerOptionsExchangeKind(amqp.ExchangeTopic),
 		xamqp.WithConsumerOptionsExchangeDurable,
@@ -116,7 +80,8 @@ func main() {
 		xamqp.WithConsumerOptionsRoutingKey("my_routing_key"),
 	)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("create consumer failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer consumer.Close()
 
@@ -126,14 +91,15 @@ func main() {
 	// consumer, so main() must keep itself alive some other way if it wants
 	// to keep receiving messages (signal.Notify, a channel, sync.WaitGroup,
 	// ...). Here we just sleep briefly so the message published above has a
-	// chance to be delivered, logged through myLogger, and acked.
+	// chance to be delivered, logged, and acked.
 	if err := consumer.Run(func(d xamqp.Delivery) xamqp.Action {
-		myLogger.Infof("received message: %s", string(d.Body))
+		slog.Info("received message", slog.String("body", string(d.Body)))
 		return xamqp.Ack
 	}); err != nil {
-		log.Fatal(err)
+		slog.Error("consumer.Run failed", slog.Any("error", err))
+		os.Exit(1)
 	}
 
-	myLogger.Infof("consumer started; Run() already returned, sleeping briefly to receive the demo message")
+	slog.Info("consumer started; Run() already returned, sleeping briefly to receive the demo message")
 	time.Sleep(2 * time.Second)
 }

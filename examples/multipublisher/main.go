@@ -8,7 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -21,16 +21,15 @@ import (
 func main() {
 	conn, err := xamqp.NewConn(
 		"amqp://guest:guest@localhost:5672/",
-		xamqp.WithConnectionOptionsLogging,
 	)
 	if err != nil {
-		log.Fatalf("failed to connect: %v", err)
+		slog.Error("failed to connect", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer conn.Close()
 
 	publisher, err := xamqp.NewPublisher(
 		conn,
-		xamqp.WithPublisherOptionsLogging,
 		xamqp.WithPublisherOptionsExchangeName("events"),
 		xamqp.WithPublisherOptionsExchangeKind("topic"),
 		xamqp.WithPublisherOptionsExchangeDurable,
@@ -38,17 +37,19 @@ func main() {
 		xamqp.WithPublisherOptionsConfirm,
 	)
 	if err != nil {
-		log.Fatalf("failed to create publisher: %v", err)
+		slog.Error("failed to create publisher", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher.Close()
 
 	publisher.NotifyReturn(func(r xamqp.Return) {
-		log.Printf("[publisher] message returned by broker: reply_code=%d reply_text=%s body=%s", r.ReplyCode, r.ReplyText, string(r.Body))
+		slog.Warn("message returned by broker",
+			slog.String("publisher", "publisher"), slog.Any("reply_code", r.ReplyCode),
+			slog.String("reply_text", r.ReplyText), slog.String("body", string(r.Body)))
 	})
 
 	publisher2, err := xamqp.NewPublisher(
 		conn,
-		xamqp.WithPublisherOptionsLogging,
 		xamqp.WithPublisherOptionsExchangeName("events"),
 		xamqp.WithPublisherOptionsExchangeKind("topic"),
 		xamqp.WithPublisherOptionsExchangeDurable,
@@ -56,12 +57,15 @@ func main() {
 		xamqp.WithPublisherOptionsConfirm,
 	)
 	if err != nil {
-		log.Fatalf("failed to create publisher2: %v", err)
+		slog.Error("failed to create publisher2", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher2.Close()
 
 	publisher2.NotifyReturn(func(r xamqp.Return) {
-		log.Printf("[publisher2] message returned by broker: reply_code=%d reply_text=%s body=%s", r.ReplyCode, r.ReplyText, string(r.Body))
+		slog.Warn("message returned by broker",
+			slog.String("publisher", "publisher2"), slog.Any("reply_code", r.ReplyCode),
+			slog.String("reply_text", r.ReplyText), slog.String("body", string(r.Body)))
 	})
 
 	// block main thread - wait for shutdown signal
@@ -77,14 +81,14 @@ func main() {
 	wg.Add(1)
 	go runPublishLoop(&wg, stop, publisher2, "my_routing_key_2", "hello, world 2")
 
-	log.Println("awaiting signal")
+	slog.Info("awaiting signal")
 	sig := <-sigs
-	log.Printf("received signal %v, shutting down", sig)
+	slog.Info("received signal, shutting down", slog.Any("signal", sig))
 
 	close(stop)
 	wg.Wait()
 
-	log.Println("stopping publishers")
+	slog.Info("stopping publishers")
 }
 
 // runPublishLoop publishes a message on the given routing key every couple
@@ -127,13 +131,13 @@ func publishOnce(publisher *xamqp.Publisher, routingKey, body string) {
 			// The connection is TCP-blocked by the broker (e.g. resource
 			// alarm such as low disk/memory). This is transient - back off
 			// and retry on the next tick rather than treating it as fatal.
-			log.Printf("[%s] publish blocked by broker (TCP block): %v", routingKey, err)
+			slog.Warn("publish blocked by broker (TCP block)", slog.String("routing_key", routingKey), slog.Any("error", err))
 		case errors.Is(err, xamqp.ErrPublishFlowPaused):
 			// The broker asked us to pause publishing (flow control) due to
 			// high load. Also transient - retry on the next tick.
-			log.Printf("[%s] publish paused by broker flow control: %v", routingKey, err)
+			slog.Warn("publish paused by broker flow control", slog.String("routing_key", routingKey), slog.Any("error", err))
 		default:
-			log.Printf("[%s] publish failed: %v", routingKey, err)
+			slog.Warn("publish failed", slog.String("routing_key", routingKey), slog.Any("error", err))
 		}
 		return
 	}
@@ -149,13 +153,13 @@ func publishOnce(publisher *xamqp.Publisher, routingKey, body string) {
 		}
 		ack, waitErr := confirmation.WaitContext(waitCtx)
 		if waitErr != nil {
-			log.Printf("[%s] timed out waiting for confirm: %v", routingKey, waitErr)
+			slog.Warn("timed out waiting for confirm", slog.String("routing_key", routingKey), slog.Any("error", waitErr))
 			continue
 		}
 		if !ack {
-			log.Printf("[%s] broker nacked message: %s", routingKey, msg)
+			slog.Warn("broker nacked message", slog.String("routing_key", routingKey), slog.String("body", msg))
 			continue
 		}
-		log.Printf("[%s] message confirmed: %s", routingKey, msg)
+		slog.Info("message confirmed", slog.String("routing_key", routingKey), slog.String("body", msg))
 	}
 }

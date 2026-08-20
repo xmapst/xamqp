@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -88,7 +89,6 @@ func NewConsumer(
 	var err error
 	consumer.chanManager, err = channel.New(
 		conn.connManager,
-		options.Logger,
 		conn.connManager.ReconnectInterval,
 	)
 	if err != nil {
@@ -125,12 +125,12 @@ func (consumer *Consumer) Run(handler Handler) error {
 	if err := consumer.startGoroutines(handlerWrapper, consumer.options); err != nil {
 		return err
 	}
-	consumer.options.Logger.Infof("successful consumer recovery")
+	slog.Info("successful consumer recovery")
 
 	go func() {
 		for range consumer.reconnectErrCh {
 			if err := consumer.startConsumerWithRetry(handlerWrapper); err != nil {
-				consumer.options.Logger.Warnf("error restarting consumer goroutines: %v", err)
+				slog.Warn("error restarting consumer goroutines", slog.Any("error", err))
 			}
 		}
 	}()
@@ -151,12 +151,12 @@ func (consumer *Consumer) startConsumerWithRetry(handlerWrapper Handler) error {
 			handlerWrapper,
 			consumer.options,
 		); err != nil {
-			consumer.options.Logger.Warnf("queue %s consumer restarting", consumer.options.QueueOptions.Name)
-			consumer.options.Logger.Warnf("error restarting consumer goroutines after cancel or close: %v", err)
+			slog.Warn("consumer restarting", slog.String("queue", consumer.options.QueueOptions.Name))
+			slog.Warn("error restarting consumer goroutines after cancel or close", slog.Any("error", err))
 			time.Sleep(3 * time.Second)
 			continue
 		}
-		consumer.options.Logger.Infof("successful consumer recovery")
+		slog.Info("successful consumer recovery")
 		return nil
 	}
 }
@@ -190,10 +190,10 @@ func (consumer *Consumer) cleanupResources() {
 	// 关闭 AMQP 通道通知 RabbitMQ 服务器停止投递消息
 	err := consumer.chanManager.Close()
 	if err != nil {
-		consumer.options.Logger.Warnf("error while closing the channel: %v", err)
+		slog.Warn("error while closing the channel", slog.Any("error", err))
 	}
 
-	consumer.options.Logger.Infof("closing consumer...")
+	slog.Info("closing consumer...")
 	go func() {
 		consumer.closeConnectionToManagerCh <- struct{}{}
 	}()
@@ -217,10 +217,10 @@ func (consumer *Consumer) CloseWithContext(ctx context.Context) {
 	consumer.markClosed()
 
 	if consumer.options.CloseGracefully {
-		consumer.options.Logger.Infof("waiting for handler to finish...")
+		slog.Info("waiting for handler to finish...")
 		err := consumer.waitForHandlerCompletion(ctx)
 		if err != nil {
-			consumer.options.Logger.Warnf("error while waiting for handler to finish: %v", err)
+			slog.Warn("error while waiting for handler to finish", slog.Any("error", err))
 		}
 	}
 
@@ -294,7 +294,7 @@ func (consumer *Consumer) startGoroutines(
 	for i := 0; i < options.Concurrency; i++ {
 		go consumer.handlerGoroutine(msgs, options, handler)
 	}
-	consumer.options.Logger.Infof("processing messages on %v goroutines", options.Concurrency)
+	slog.Info("processing messages", slog.Int("goroutines", options.Concurrency))
 	return nil
 }
 
@@ -313,7 +313,7 @@ func (consumer *Consumer) getIsClosed() bool {
 //
 // 当消费者关闭时，msgs 通道被关闭，for range 循环退出。
 func (consumer *Consumer) handlerGoroutine(msgs <-chan amqp.Delivery, consumeOptions ConsumerOptions, handler Handler) {
-	defer consumer.options.Logger.Infof("rabbit consumer goroutine closed")
+	defer slog.Info("rabbit consumer goroutine closed")
 
 	for msg := range msgs {
 		if consumer.getIsClosed() {
@@ -331,7 +331,7 @@ func (consumer *Consumer) handlerGoroutine(msgs <-chan amqp.Delivery, consumeOpt
 func (consumer *Consumer) handlerWrapper(consumeOptions ConsumerOptions, handler Handler, msg amqp.Delivery) {
 	defer func() {
 		if r := recover(); r != nil {
-			consumer.options.Logger.Errorf("panic in consumer handler: %v", r)
+			slog.Error("panic in consumer handler", slog.Any("panic", r))
 			if !consumeOptions.RabbitConsumerOptions.AutoAck {
 				_ = msg.Nack(false, false) // 丢弃而非重入队，防止毒丸消息反复触发 panic
 			}
@@ -347,17 +347,17 @@ func (consumer *Consumer) handlerWrapper(consumeOptions ConsumerOptions, handler
 	case Ack:
 		err := msg.Ack(false)
 		if err != nil {
-			consumer.options.Logger.Errorf("can't ack message: %v", err)
+			slog.Error("can't ack message", slog.Any("error", err))
 		}
 	case NackDiscard:
 		err := msg.Nack(false, false) // requeue=false：丢弃到死信队列
 		if err != nil {
-			consumer.options.Logger.Errorf("can't nack message: %v", err)
+			slog.Error("can't nack message", slog.Any("error", err))
 		}
 	case NackRequeue:
 		err := msg.Nack(false, true) // requeue=true：重新入队等待重试
 		if err != nil {
-			consumer.options.Logger.Errorf("can't nack message: %v", err)
+			slog.Error("can't nack message", slog.Any("error", err))
 		}
 	default:
 		// Manual 模式或其他情况：由业务代码自行调用 msg.Ack()/Nack()

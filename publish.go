@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -126,7 +127,7 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 		options:                      *options,
 	}
 	var err error
-	publisher.chanManager, err = channel.New(conn.connManager, options.Logger, conn.connManager.ReconnectInterval)
+	publisher.chanManager, err = channel.New(conn.connManager, conn.connManager.ReconnectInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -171,13 +172,13 @@ func NewPublisher(conn *Conn, optionFuncs ...func(*PublisherOptions)) (*Publishe
 	// 永久停止刷新流控状态和确认回调，且不给调用方任何提示。
 	go func() {
 		for reconnectErr := range publisher.reconnectErrCh {
-			publisher.options.Logger.Infof("successful publisher recovery from: %v", reconnectErr)
+			slog.Info("successful publisher recovery", slog.Any("error", reconnectErr))
 			for {
 				if publisher.getIsClosed() {
 					return
 				}
 				if err := publisher.startup(); err != nil {
-					publisher.options.Logger.Errorf("error on startup for publisher after cancel or close: %v", err)
+					slog.Error("error on startup for publisher after cancel or close", slog.Any("error", err))
 					time.Sleep(3 * time.Second)
 					continue
 				}
@@ -371,9 +372,9 @@ func (publisher *Publisher) Close() {
 
 		err := publisher.chanManager.Close()
 		if err != nil {
-			publisher.options.Logger.Warnf("error while closing the channel: %v", err)
+			slog.Warn("error while closing the channel", slog.Any("error", err))
 		}
-		publisher.options.Logger.Infof("closing publisher...")
+		slog.Info("closing publisher...")
 		publisher.disablePublishDueToBlockedMu.RLock()
 		blocking := publisher.blocking
 		publisher.disablePublishDueToBlockedMu.RUnlock()
@@ -497,7 +498,7 @@ func (publisher *Publisher) startReturnHandler() {
 func (publisher *Publisher) invokeReturnHandler(r Return) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			publisher.options.Logger.Errorf("panic in return handler: %v", rec)
+			slog.Error("panic in return handler", slog.Any("panic", rec))
 		}
 	}()
 	publisher.handlerMu.Lock()
@@ -536,7 +537,7 @@ func (publisher *Publisher) startPublishHandler() {
 	}
 
 	if err := publisher.chanManager.ConfirmSafe(false); err != nil {
-		publisher.options.Logger.Errorf("could not put channel in confirm mode: %v", err)
+		slog.Error("could not put channel in confirm mode", slog.Any("error", err))
 		return
 	}
 
@@ -580,7 +581,7 @@ func (publisher *Publisher) startPublishHandler() {
 func (publisher *Publisher) invokePublishHandler(c amqp.Confirmation) {
 	defer func() {
 		if r := recover(); r != nil {
-			publisher.options.Logger.Errorf("panic in publish handler: %v", r)
+			slog.Error("panic in publish handler", slog.Any("panic", r))
 		}
 	}()
 	publisher.handlerMu.Lock()

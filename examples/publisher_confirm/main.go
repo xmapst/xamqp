@@ -25,7 +25,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -39,18 +40,18 @@ const (
 )
 
 func main() {
-	// 1. Connect. WithConnectionOptionsLogging turns on xamqp's default
-	// stdout/stderr logger so reconnect/flow-control activity is visible.
+	// 1. Connect. xamqp logs reconnect/flow-control activity via the
+	// standard library's log/slog package (slog.Default() by default).
 	conn, err := xamqp.NewConn(
 		"amqp://guest:guest@localhost:5672/",
-		xamqp.WithConnectionOptionsLogging,
 	)
 	if err != nil {
-		log.Fatalf("failed to connect to RabbitMQ: %v", err)
+		slog.Error("failed to connect to RabbitMQ", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			log.Printf("error closing connection: %v", err)
+			slog.Error("error closing connection", slog.Any("error", err))
 		}
 	}()
 
@@ -62,21 +63,21 @@ func main() {
 	// value, never as a side effect of a plain Publish call blocking.
 	publisher, err := xamqp.NewPublisher(
 		conn,
-		xamqp.WithPublisherOptionsLogging,
 		xamqp.WithPublisherOptionsExchangeName(exchangeName),
 		xamqp.WithPublisherOptionsExchangeKind(amqp.ExchangeDirect),
 		xamqp.WithPublisherOptionsExchangeDeclare,
 		xamqp.WithPublisherOptionsConfirm,
 	)
 	if err != nil {
-		log.Fatalf("failed to create publisher: %v", err)
+		slog.Error("failed to create publisher", slog.Any("error", err))
+		os.Exit(1)
 	}
 	defer publisher.Close()
 
 	// Optional: know when a mandatory message couldn't be routed to any queue.
 	publisher.NotifyReturn(func(r xamqp.Return) {
-		log.Printf("[return] undeliverable message: exchange=%s routing_key=%s body=%s",
-			r.Exchange, r.RoutingKey, string(r.Body))
+		slog.Warn("undeliverable message",
+			slog.String("exchange", r.Exchange), slog.String("routing_key", r.RoutingKey), slog.String("body", string(r.Body)))
 	})
 
 	// -------------------------------------------------------------------
@@ -89,14 +90,11 @@ func main() {
 	// plain Publish/PublishWithContext call.
 	// -------------------------------------------------------------------
 	publisher.NotifyPublish(func(p xamqp.Confirmation) {
-		if p.Ack {
-			log.Printf("[async confirm] ACK  delivery_tag=%d reconnects=%d", p.DeliveryTag, p.ReconnectionCount)
-		} else {
-			log.Printf("[async confirm] NACK delivery_tag=%d reconnects=%d", p.DeliveryTag, p.ReconnectionCount)
-		}
+		slog.Info("async confirm",
+			slog.Bool("ack", p.Ack), slog.Uint64("delivery_tag", p.DeliveryTag), slog.Int("reconnects", p.ReconnectionCount))
 	})
 
-	log.Println("=== style 1: fire-and-forget PublishWithContext, confirms arrive later via NotifyPublish ===")
+	slog.Info("style 1: fire-and-forget PublishWithContext, confirms arrive later via NotifyPublish")
 	for i := range 5 {
 		body := fmt.Appendf(nil, "async message #%d", i)
 
@@ -118,15 +116,15 @@ func main() {
 			// pause, not rejecting the message outright.
 			switch {
 			case errors.Is(err, xamqp.ErrPublishFlowPaused):
-				log.Printf("publish #%d paused by server flow control, retry later: %v", i, err)
+				slog.Warn("publish paused by server flow control, retry later", slog.Int("index", i), slog.Any("error", err))
 			case errors.Is(err, xamqp.ErrPublishBlocked):
-				log.Printf("publish #%d blocked by TCP-level block, retry later: %v", i, err)
+				slog.Warn("publish blocked by TCP-level block, retry later", slog.Int("index", i), slog.Any("error", err))
 			default:
-				log.Printf("publish #%d failed: %v", i, err)
+				slog.Warn("publish failed", slog.Int("index", i), slog.Any("error", err))
 			}
 			continue
 		}
-		log.Printf("sent async message #%d (call returned immediately; no ack yet)", i)
+		slog.Info("sent async message (call returned immediately; no ack yet)", slog.Int("index", i))
 	}
 
 	// This program is about to move on to style 2 and then exit, so give the
@@ -143,7 +141,7 @@ func main() {
 	// routing key) that the caller can explicitly wait on right here, instead
 	// of correlating the result in an async callback.
 	// -------------------------------------------------------------------
-	log.Println("=== style 2: PublishWithDeferredConfirmWithContext, wait for the ack explicitly ===")
+	slog.Info("style 2: PublishWithDeferredConfirmWithContext, wait for the ack explicitly")
 
 	confirmations, err := publisher.PublishWithDeferredConfirmWithContext(
 		context.Background(),
@@ -156,18 +154,21 @@ func main() {
 	if err != nil {
 		switch {
 		case errors.Is(err, xamqp.ErrPublishFlowPaused):
-			log.Fatalf("publish paused by server flow control: %v", err)
+			slog.Error("publish paused by server flow control", slog.Any("error", err))
+			os.Exit(1)
 		case errors.Is(err, xamqp.ErrPublishBlocked):
-			log.Fatalf("publish blocked by TCP-level block: %v", err)
+			slog.Error("publish blocked by TCP-level block", slog.Any("error", err))
+			os.Exit(1)
 		default:
-			log.Fatalf("deferred-confirm publish failed: %v", err)
+			slog.Error("deferred-confirm publish failed", slog.Any("error", err))
+			os.Exit(1)
 		}
 	}
 
 	for i, confirmation := range confirmations {
 		if confirmation == nil {
 			// Only happens if the publisher somehow isn't in confirm mode.
-			log.Printf("routing key #%d: no confirmation object (publisher not in confirm mode)", i)
+			slog.Info("no confirmation object (publisher not in confirm mode)", slog.Int("index", i))
 			continue
 		}
 
@@ -175,15 +176,15 @@ func main() {
 		ok, err := confirmation.WaitContext(waitCtx)
 		cancel()
 		if err != nil {
-			log.Printf("routing key #%d: error waiting for confirmation: %v", i, err)
+			slog.Warn("error waiting for confirmation", slog.Int("index", i), slog.Any("error", err))
 			continue
 		}
 		if ok {
-			log.Printf("routing key #%d: broker ACKed the message", i)
+			slog.Info("broker ACKed the message", slog.Int("index", i))
 		} else {
-			log.Printf("routing key #%d: broker NACKed the message", i)
+			slog.Warn("broker NACKed the message", slog.Int("index", i))
 		}
 	}
 
-	log.Println("done")
+	slog.Info("done")
 }

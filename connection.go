@@ -1,6 +1,7 @@
 package xamqp
 
 import (
+	"log/slog"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -43,7 +44,7 @@ func NewConn(url string, opts ...func(*ConnectionOptions)) (*Conn, error) {
 		options: *options,
 	}
 	var err error
-	conn.connManager, err = connection.New(url, amqp.Config(options.Config), options.Logger, options.ReconnectInterval)
+	conn.connManager, err = connection.New(url, amqp.Config(options.Config), options.ReconnectInterval)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +57,7 @@ func NewConn(url string, opts ...func(*ConnectionOptions)) (*Conn, error) {
 // handleRestarts 监听连接重建事件并记录日志。
 func (conn *Conn) handleRestarts() {
 	for err := range conn.reconnectErrCh {
-		conn.options.Logger.Infof("successful connection recovery from: %v", err)
+		slog.Info("successful connection recovery", slog.Any("error", err))
 	}
 }
 

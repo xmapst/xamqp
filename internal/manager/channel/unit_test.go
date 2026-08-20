@@ -7,19 +7,10 @@ import (
 	"time"
 )
 
-// noopLogger 供测试直接构造 Manager 时使用，避免依赖真实的日志实现。
-type noopLogger struct{}
-
-func (noopLogger) Errorf(string, ...any) {}
-func (noopLogger) Warnf(string, ...any)  {}
-func (noopLogger) Infof(string, ...any)  {}
-func (noopLogger) Debugf(string, ...any) {}
-
 // newTestManager 构造一个不依赖真实 AMQP 通道的最小 Manager，
 // 只用于测试完全不触碰 m.channel 字段的逻辑（锁获取、confirmMode 状态）。
 func newTestManager() *Manager {
 	return &Manager{
-		logger:    noopLogger{},
 		channelMu: &sync.RWMutex{},
 	}
 }

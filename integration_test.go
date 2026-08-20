@@ -25,16 +25,6 @@ import (
 
 const enableDockerIntegrationTestsFlag = `ENABLE_DOCKER_INTEGRATION_TESTS`
 
-// testLogger 是一个最小化的 ILogger 实现，把日志转发给 t.Logf。
-type testLogger struct {
-	logf func(format string, args ...any)
-}
-
-func (l testLogger) Errorf(format string, args ...any) { l.logf("ERROR: "+format, args...) }
-func (l testLogger) Warnf(format string, args ...any)  { l.logf("WARN: "+format, args...) }
-func (l testLogger) Infof(format string, args ...any)  { l.logf("INFO: "+format, args...) }
-func (l testLogger) Debugf(format string, args ...any) { l.logf("DEBUG: "+format, args...) }
-
 // prepareDockerTest 检查是否启用了集成测试；启用时用 docker 启动一个
 // 一次性的 RabbitMQ 容器，返回连接串，并注册测试结束时的清理。
 func prepareDockerTest(t *testing.T) (connStr string) {
@@ -81,8 +71,6 @@ func waitForHealthyAmqp(t *testing.T, connStr string, optionFuncs ...func(*Conne
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	quietLogger := testLogger{logf: func(string, ...any) {}}
-
 	var lastErr error
 	for {
 		select {
@@ -90,8 +78,7 @@ func waitForHealthyAmqp(t *testing.T, connStr string, optionFuncs ...func(*Conne
 			t.Fatalf("timed out waiting for a healthy amqp connection: %v", lastErr)
 			return nil
 		case <-ticker.C:
-			opts := append([]func(*ConnectionOptions){WithConnectionOptionsLogger(quietLogger)}, optionFuncs...)
-			conn, err := NewConn(connStr, opts...)
+			conn, err := NewConn(connStr, optionFuncs...)
 			if err != nil {
 				lastErr = err
 				t.Logf("connection attempt failed, retrying: %v", err)
@@ -99,7 +86,7 @@ func waitForHealthyAmqp(t *testing.T, connStr string, optionFuncs ...func(*Conne
 			}
 
 			pingErr := func() error {
-				pub, err := NewPublisher(conn, WithPublisherOptionsLogger(quietLogger))
+				pub, err := NewPublisher(conn)
 				if err != nil {
 					return fmt.Errorf("failed to set up ping publisher: %w", err)
 				}
@@ -127,7 +114,6 @@ func TestSimplePubSub(t *testing.T) {
 	const queueName = "xamqp_integration_simple_pubsub"
 
 	consumer, err := NewConsumer(conn, queueName,
-		WithConsumerOptionsLogger(testLogger{logf: t.Logf}),
 		WithConsumerOptionsQueueDurable,
 	)
 	if err != nil {
@@ -147,7 +133,7 @@ func TestSimplePubSub(t *testing.T) {
 		t.Fatalf("consumer.Run failed: %v", err)
 	}
 
-	publisher, err := NewPublisher(conn, WithPublisherOptionsLogger(testLogger{logf: t.Logf}))
+	publisher, err := NewPublisher(conn)
 	if err != nil {
 		t.Fatalf("error creating publisher: %v", err)
 	}

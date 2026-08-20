@@ -3,6 +3,7 @@ package connection
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"sync"
 	"time"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/xmapst/xamqp/internal/backoff"
 	"github.com/xmapst/xamqp/internal/dispatcher"
-	"github.com/xmapst/xamqp/internal/logger"
 )
 
 // Manager 管理 RabbitMQ 连接的生命周期，实现连接断线自动重建。
@@ -44,7 +44,6 @@ import (
 //     只靠原生恢复那样在重试耗尽后永久停摆。StateClosed 且 Err == nil
 //     对应用户主动 Close()，仅记录日志。
 type Manager struct {
-	logger              logger.ILogger   // 日志实现
 	url                 string           // 连接地址，创建后不再变更
 	connection          *amqp.Connection // AMQP 连接，受 connectionMu 保护
 	amqpConfig          amqp.Config      // 建立连接时使用的协商参数，创建后不再变更
@@ -101,13 +100,12 @@ func (m *Manager) dial() (*amqp.Connection, error) {
 }
 
 // New 创建连接管理器，建立初始连接并启动连接异常监听和阻塞信号读取。
-func New(url string, conf amqp.Config, log logger.ILogger, reconnectInterval time.Duration) (*Manager, error) {
+func New(url string, conf amqp.Config, reconnectInterval time.Duration) (*Manager, error) {
 	if conf.Recovery == nil {
 		conf.Recovery = defaultRecovery(reconnectInterval)
 	}
 
 	connManager := Manager{
-		logger:                             log,
 		url:                                url,
 		amqpConfig:                         conf,
 		connectionMu:                       &sync.RWMutex{},
@@ -152,7 +150,7 @@ func (m *Manager) Close() error {
 	m.closed = true
 	close(m.closeSignal)
 
-	m.logger.Infof("closing connection manager...")
+	slog.Info("closing connection manager...")
 	return m.connection.Close()
 }
 
@@ -199,17 +197,17 @@ func (m *Manager) handleStateChanges(stateCh <-chan *amqp.StateChanged) {
 	for sc := range stateCh {
 		switch sc.To {
 		case amqp.StateReconnecting:
-			m.logger.Warnf("amqp connection lost, native recovery in progress")
+			slog.Warn("amqp connection lost, native recovery in progress")
 		case amqp.StateOpen:
-			m.logger.Infof("amqp connection recovered by native recovery")
+			slog.Info("amqp connection recovered by native recovery")
 		case amqp.StateClosed:
 			if sc.Err != nil {
-				m.logger.Errorf("native recovery exhausted, falling back to full reconnect: %v", sc.Err)
+				slog.Error("native recovery exhausted, falling back to full reconnect", slog.Any("error", sc.Err))
 				m.reconnectLoop()
-				m.logger.Warnf("successfully reconnected to amqp server")
+				slog.Warn("successfully reconnected to amqp server")
 				_ = m.dispatcher.Dispatch(sc.Err)
 			} else {
-				m.logger.Infof("amqp connection closed gracefully")
+				slog.Info("amqp connection closed gracefully")
 			}
 			return
 		default:
@@ -239,10 +237,10 @@ func (m *Manager) reconnectLoop() {
 
 	for {
 		delay := backoff.Delay(m.ReconnectInterval, attempt)
-		m.logger.Infof("waiting %s to attempt to reconnect to amqp server", delay)
+		slog.Info("waiting to attempt to reconnect to amqp server", slog.Duration("delay", delay))
 		select {
 		case <-m.closeSignal:
-			m.logger.Infof("connection manager closed, stopping reconnect loop")
+			slog.Info("connection manager closed, stopping reconnect loop")
 			return
 		case <-time.After(delay):
 		}
@@ -250,10 +248,10 @@ func (m *Manager) reconnectLoop() {
 		err := m.reconnect()
 		if err != nil {
 			if errors.Is(err, errClosed) {
-				m.logger.Infof("connection manager closed, stopping reconnect loop")
+				slog.Info("connection manager closed, stopping reconnect loop")
 				return
 			}
-			m.logger.Errorf("error reconnecting to amqp server: %v", err)
+			slog.Error("error reconnecting to amqp server", slog.Any("error", err))
 			attempt++
 		} else {
 			m.incrementReconnectionCount()
@@ -279,7 +277,7 @@ func (m *Manager) reconnect() error {
 	if m.closed {
 		m.connectionMu.Unlock()
 		if cerr := conn.Close(); cerr != nil {
-			m.logger.Warnf("error closing redundant connection after manager was closed: %v", cerr)
+			slog.Warn("error closing redundant connection after manager was closed", slog.Any("error", cerr))
 		}
 		return errClosed
 	}
@@ -301,7 +299,7 @@ func (m *Manager) reconnect() error {
 
 	// 先建立并安装新连接，再关闭旧连接，保证不出现无连接可用的空窗期。
 	if err = oldConnection.Close(); err != nil {
-		m.logger.Warnf("error closing connection while reconnecting: %v", err)
+		slog.Warn("error closing connection while reconnecting", slog.Any("error", err))
 	}
 	return nil
 }

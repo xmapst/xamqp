@@ -127,6 +127,22 @@ func (m *Manager) ExchangeBindSafe(
 	)
 }
 
+// ExchangeUnbindSafe 线程安全版本的交换机到交换机解除绑定（E2E Binding）。
+func (m *Manager) ExchangeUnbindSafe(
+	name string, key string, exchange string, noWait bool, args amqp.Table,
+) error {
+	m.channelMu.RLock()
+	defer m.channelMu.RUnlock()
+
+	return m.channel.ExchangeUnbind(
+		name,
+		key,
+		exchange,
+		noWait,
+		args,
+	)
+}
+
 // QueueBindSafe 线程安全版本的队列到交换机绑定。
 func (m *Manager) QueueBindSafe(
 	name string, key string, exchange string, noWait bool, args amqp.Table,
@@ -139,6 +155,21 @@ func (m *Manager) QueueBindSafe(
 		key,
 		exchange,
 		noWait,
+		args,
+	)
+}
+
+// QueueUnbindSafe 线程安全版本的队列到交换机解除绑定。
+func (m *Manager) QueueUnbindSafe(
+	name string, key string, exchange string, args amqp.Table,
+) error {
+	m.channelMu.RLock()
+	defer m.channelMu.RUnlock()
+
+	return m.channel.QueueUnbind(
+		name,
+		key,
+		exchange,
 		args,
 	)
 }

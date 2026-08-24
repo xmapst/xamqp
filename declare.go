@@ -75,6 +75,36 @@ func (d *Declarator) BindExchanges(bindings []Binding) error {
 	return nil
 }
 
+func (d *Declarator) UnbindExchanges(bindings []Binding) error {
+	for _, binding := range bindings {
+		err := d.chanManager.ExchangeUnbindSafe(
+			binding.Destination,
+			binding.RoutingKey,
+			binding.Source,
+			binding.NoWait,
+			binding.Args,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Declarator) UnbindExchange(binding Binding) error {
+	err := d.chanManager.ExchangeUnbindSafe(
+		binding.Destination,
+		binding.RoutingKey,
+		binding.Source,
+		binding.NoWait,
+		binding.Args,
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // BindQueues 创建交换机到队列的绑定关系。
 //
 // 绑定关系决定消息从交换机路由到哪些队列，
@@ -91,6 +121,34 @@ func (d *Declarator) BindQueues(bindings []Binding) error {
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d *Declarator) UnbindQueues(bindings []Binding) error {
+	for _, binding := range bindings {
+		err := d.chanManager.QueueUnbindSafe(
+			binding.Destination,
+			binding.RoutingKey,
+			binding.Source,
+			binding.Args,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Declarator) UnbBindQueue(binding Binding) error {
+	err := d.chanManager.QueueUnbindSafe(
+		binding.Destination,
+		binding.RoutingKey,
+		binding.Source,
+		binding.Args,
+	)
+	if err != nil {
+		return err
 	}
 	return nil
 }

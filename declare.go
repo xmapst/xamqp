@@ -2,7 +2,7 @@ package xamqp
 
 import (
 	"errors"
-
+	
 	"github.com/xmapst/xamqp/internal/manager/channel"
 )
 
@@ -21,20 +21,20 @@ func NewDeclarator(conn *Conn, optionFuncs ...func(*DeclareOptions)) (*Declarato
 	for _, optionFunc := range optionFuncs {
 		optionFunc(options)
 	}
-
+	
 	if conn.connManager == nil {
 		return nil, errors.New("connection manager can't be nil")
 	}
-
+	
 	chanManager, err := channel.New(conn.connManager, conn.connManager.ReconnectInterval)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	result := &Declarator{
 		chanManager: chanManager,
 	}
-
+	
 	return result, nil
 }
 
@@ -66,12 +66,12 @@ func (d *Declarator) BindExchanges(bindings []Binding) error {
 			binding.NoWait,
 			binding.Args,
 		)
-
+		
 		if err != nil {
 			return err
 		}
 	}
-
+	
 	return nil
 }
 
@@ -140,7 +140,7 @@ func (d *Declarator) UnbindQueues(bindings []Binding) error {
 	return nil
 }
 
-func (d *Declarator) UnbBindQueue(binding Binding) error {
+func (d *Declarator) UnbindQueue(binding Binding) error {
 	err := d.chanManager.QueueUnbindSafe(
 		binding.Destination,
 		binding.RoutingKey,

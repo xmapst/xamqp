@@ -33,6 +33,22 @@ func TestMaskPassword(t *testing.T) {
 	})
 }
 
+func TestIsPermanentlyClosedOnlyTracksManagerClose(t *testing.T) {
+	m := newTestManager()
+
+	if m.IsPermanentlyClosed() {
+		t.Fatal("a live manager must not be reported as permanently closed")
+	}
+
+	m.connectionMu.Lock()
+	m.closed = true
+	m.connectionMu.Unlock()
+
+	if !m.IsPermanentlyClosed() {
+		t.Fatal("an explicitly closed manager must be reported as permanently closed")
+	}
+}
+
 func contains(s, substr string) bool {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

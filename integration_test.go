@@ -112,6 +112,7 @@ func TestSimplePubSub(t *testing.T) {
 	defer conn.Close()
 
 	const queueName = "xamqp_integration_simple_pubsub"
+	cleanupTestQueue(t, connStr, queueName)
 
 	consumer, err := NewConsumer(conn, queueName,
 		WithConsumerOptionsQueueDurable,

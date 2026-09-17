@@ -27,8 +27,18 @@ func TestCloseSubscriber(t *testing.T) {
 	d := New()
 	_, closeCh := d.AddSubscriber()
 	close(closeCh)
-	time.Sleep(time.Millisecond)
-	if len(d.subscribers) != 0 {
-		t.Error("Dispatcher subscribers length is not 0")
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		d.subscribersMu.Lock()
+		count := len(d.subscribers)
+		d.subscribersMu.Unlock()
+		if count == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Dispatcher subscribers length is not 0")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

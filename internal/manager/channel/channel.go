@@ -135,10 +135,11 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			go m.drainStateChanges(stateCh)
 
 			slog.Error("attempting to reconnect to amqp server after cancel", slog.String("tag", tag))
-			m.reconnectLoop()
-			slog.Warn("successfully reconnected to amqp server after cancel")
-			if err := m.dispatcher.Dispatch(errors.New(tag)); err != nil {
-				slog.Warn("channel dispatch error", slog.Any("error", err))
+			if m.reconnectLoop() {
+				slog.Warn("successfully reconnected to amqp server after cancel")
+				if err := m.dispatcher.Dispatch(errors.New(tag)); err != nil {
+					slog.Warn("channel dispatch error", slog.Any("error", err))
+				}
 			}
 			return
 		case sc, ok := <-stateCh:
@@ -153,9 +154,10 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			case amqp.StateClosed:
 				if sc.Err != nil {
 					slog.Error("native recovery exhausted, falling back to full channel rebuild", slog.Any("error", sc.Err))
-					m.reconnectLoop()
-					slog.Warn("successfully reconnected to amqp server")
-					_ = m.dispatcher.Dispatch(sc.Err)
+					if m.reconnectLoop() {
+						slog.Warn("successfully reconnected to amqp server")
+						_ = m.dispatcher.Dispatch(sc.Err)
+					}
 				} else {
 					slog.Info("amqp channel closed gracefully")
 				}
@@ -196,6 +198,8 @@ func (m *Manager) incrementReconnectionCount() {
 }
 
 // reconnectLoop 持续尝试重建通道，使用带抖动的指数退避，直到成功或管理器被关闭。
+// 返回 true 表示确实安装了一个新通道；返回 false 表示因通道或连接管理器被
+// 调用方永久关闭而退出，调用方不得在这种情况下广播“恢复成功”事件。
 //
 // 等待退避时间时 select 着 closeSignal：Close() 会立刻打断等待并退出，
 // 不必等满一整个退避周期才发现管理器已经关闭。
@@ -213,7 +217,7 @@ func (m *Manager) incrementReconnectionCount() {
 // 正停在 select 里等待时才能送达；若那一刻本方法恰好在执行 reconnect()
 // 本身（网络 I/O 中），Dispatch 最多阻塞 5 秒后放弃投递，这次事件就错过
 // 了——退化为原来"各自独立退避"的行为，不会更差，只是没能加速。
-func (m *Manager) reconnectLoop() {
+func (m *Manager) reconnectLoop() bool {
 	attempt := 0
 
 	connReconnected, unsubscribeConnReconnect := m.notifyConnReconnect()
@@ -225,7 +229,7 @@ func (m *Manager) reconnectLoop() {
 		select {
 		case <-m.closeSignal:
 			slog.Info("channel manager closed, stopping reconnect loop")
-			return
+			return false
 		case <-connReconnected:
 			slog.Info("underlying connection recovered, retrying immediately instead of waiting out the backoff")
 		case <-time.After(delay):
@@ -235,7 +239,7 @@ func (m *Manager) reconnectLoop() {
 		if err != nil {
 			if errors.Is(err, errClosed) {
 				slog.Info("channel manager closed, stopping reconnect loop")
-				return
+				return false
 			}
 			// 所属连接管理器已经被 Close：这不是可以靠重试恢复的瞬时错误，
 			// 通道永远不可能在一个已经关掉的连接上重建成功。必须显式识别
@@ -245,16 +249,16 @@ func (m *Manager) reconnectLoop() {
 			// 任何子 channel.Manager，而 m.closeSignal 只有 channel.Manager
 			// 自己的 Close() 才会关闭。用户先关 Conn 再关 Consumer/Publisher
 			// （README 建议反过来，但没有强制）就会命中这条路径。
-			if m.connManager.IsClosed() {
+			if m.connManager.IsPermanentlyClosed() {
 				slog.Info("connection manager is closed, stopping channel reconnect loop")
-				return
+				return false
 			}
 			slog.Error("error reconnecting to amqp server", slog.Any("error", err))
 			attempt++
 		} else {
 			// 重连计数已在 reconnect() 内与通道装入原子地一起递增，此处不再重复递增。
 			go m.startNotifyCancelOrClosed() // 重连成功后继续监听新通道的异常
-			return
+			return true
 		}
 	}
 }

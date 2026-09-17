@@ -312,6 +312,18 @@ func (m *Manager) IsClosed() bool {
 	return m.closed || m.connection.IsClosed()
 }
 
+// IsPermanentlyClosed 返回连接管理器是否已被调用方显式关闭。
+//
+// 与 IsClosed 不同，本方法不把底层 AMQP 连接在断线恢复期间的临时 closed
+// 状态算作永久关闭。通道管理器用它判断是否应停止自己的重连循环：临时断线
+// 必须继续等待连接恢复，只有 Conn.Close() 才能让子通道彻底放弃重连。
+func (m *Manager) IsPermanentlyClosed() bool {
+	m.connectionMu.RLock()
+	defer m.connectionMu.RUnlock()
+
+	return m.closed
+}
+
 // maskPassword 将 AMQP URL 中的密码替换为 "***"，用于安全日志输出。
 //
 // 解析失败时返回固定占位串而不是原始输入：原始字符串可能就是一个

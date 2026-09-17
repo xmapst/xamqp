@@ -134,6 +134,44 @@ func TestHandleCancelOrStateChange_ExhaustedRecoveryEntersReconnectLoop(t *testi
 	}
 }
 
+// TestHandleCancelOrStateChange_AbortedReconnectDoesNotDispatch 验证通道重建
+// 因管理器关闭而退出时，不会向 Consumer/Publisher 广播一个虚假的“恢复成功”
+// 事件。否则它们会在已经关闭的旧通道上执行 Qos/ExchangeDeclare，并永久得到
+// amqp.ErrClosed（504 channel/connection is not open）。
+func TestHandleCancelOrStateChange_AbortedReconnectDoesNotDispatch(t *testing.T) {
+	closeSignal := make(chan struct{})
+	close(closeSignal)
+
+	m := &Manager{
+		closeSignal:         closeSignal,
+		reconnectInterval:   time.Hour,
+		dispatcher:          dispatcher.New(),
+		notifyConnReconnect: stubNotifyReconnect,
+	}
+
+	events, unsubscribe := m.dispatcher.AddSubscriber()
+	t.Cleanup(func() { unsubscribe <- struct{}{} })
+	received := make(chan struct{}, 1)
+	ready := make(chan struct{})
+	go func() {
+		close(ready)
+		if _, ok := <-events; ok {
+			received <- struct{}{}
+		}
+	}()
+	<-ready
+
+	stateCh := make(chan *amqp.StateChanged, 1)
+	stateCh <- &amqp.StateChanged{To: amqp.StateClosed, Err: errors.New("recovery exhausted")}
+	m.handleCancelOrStateChange(nil, stateCh)
+
+	select {
+	case <-received:
+		t.Fatal("aborted channel reconnect dispatched a false recovery-success event")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 // TestHandleCancelOrStateChange_CancelEntersReconnectLoop 验证 basic.cancel
 // （NotifyCancel）独立于原生恢复触发 xamqp 自己的兜底 reconnectLoop——
 // 一个仍然存活的通道被服务器取消消费者时，不会被原生恢复处理，必须由

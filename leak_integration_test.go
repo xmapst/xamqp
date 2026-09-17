@@ -41,6 +41,28 @@ func requireExternalBroker(t *testing.T) string {
 	return url
 }
 
+// cleanupTestQueue 注册测试结束清理，避免真实 Broker 上累积 durable 测试队列。
+func cleanupTestQueue(t *testing.T, url, queue string) {
+	t.Helper()
+	t.Cleanup(func() {
+		conn, err := amqp.Dial(url)
+		if err != nil {
+			t.Logf("cleanup queue %s: connect failed: %v", queue, err)
+			return
+		}
+		defer conn.Close()
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Logf("cleanup queue %s: channel failed: %v", queue, err)
+			return
+		}
+		defer ch.Close()
+		if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
+			t.Logf("cleanup queue %s: delete failed: %v", queue, err)
+		}
+	})
+}
+
 // silenceLogging 把进程默认 slog logger 换成 discard，避免实测输出被
 // 重连日志淹没；测试结束时自动还原。
 func silenceLogging(t *testing.T) {
@@ -87,6 +109,7 @@ func TestLeakConsumerOnlyConnLifecycle(t *testing.T) {
 
 	const cycles = 8
 	queue := fmt.Sprintf("xamqp_leak_consumeronly_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, url, queue)
 
 	// 预热一轮：首次连接会初始化若干一次性的运行时/库内部 goroutine，
 	// 不预热会把这些一次性开销算进"泄漏"。
@@ -149,6 +172,7 @@ func TestLeakBasicCancelChannelRebuild(t *testing.T) {
 
 	const cancels = 6
 	queue := fmt.Sprintf("xamqp_leak_cancel_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, url, queue)
 
 	conn, err := NewConn(url,
 		WithConnectionOptionsReconnectInterval(200*time.Millisecond),
@@ -222,6 +246,7 @@ func TestLeakConnCloseBeforeChildren(t *testing.T) {
 	url := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_leak_closeorder_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, url, queue)
 
 	before := settledGoroutines(5 * time.Second)
 
@@ -271,6 +296,7 @@ func TestGracefulCloseWaitsForInFlightHandler(t *testing.T) {
 	url := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_graceful_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, url, queue)
 
 	conn, err := NewConn(url)
 	if err != nil {

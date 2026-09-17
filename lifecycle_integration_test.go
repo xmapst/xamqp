@@ -14,14 +14,19 @@ package xamqp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+const rabbitMQContainerEnv = "XAMQP_TEST_RABBITMQ_CONTAINER"
 
 // managementAPI 从 AMQP 连接串推导出管理接口地址与凭据。
 type managementAPI struct {
@@ -191,6 +196,7 @@ func TestLifecycleConnectionDropRecovery(t *testing.T) {
 	mgmt := newManagementAPI(t, amqpURL)
 
 	queue := fmt.Sprintf("xamqp_lifecycle_drop_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, amqpURL, queue)
 
 	conn, err := NewConn(amqpURL,
 		WithConnectionOptionsReconnectInterval(300*time.Millisecond),
@@ -262,6 +268,7 @@ func TestLifecycleQueueDeletedRecovery(t *testing.T) {
 	amqpURL := requireExternalBroker(t)
 
 	queue := fmt.Sprintf("xamqp_lifecycle_qdel_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, amqpURL, queue)
 
 	conn, err := NewConn(amqpURL,
 		WithConnectionOptionsReconnectInterval(300*time.Millisecond),
@@ -312,6 +319,167 @@ func TestLifecycleQueueDeletedRecovery(t *testing.T) {
 			"the basic.cancel recovery path is broken")
 	}
 	t.Log("DATA queue-deleted: round-trip OK again after queue deletion (consumer resubscribed)")
+}
+
+// TestLifecycleRecoveryAfterNativeRecoveryExhaustion 验证 amqp091-go 的原生
+// 恢复重试全部耗尽后，xamqp 能切换到自己的全连接重建，并带动 Consumer 和
+// Publisher 的通道恢复。该路径需要停止/启动测试 RabbitMQ 容器，因此除
+// XAMQP_TEST_AMQP_URL 外还需显式设置 XAMQP_TEST_RABBITMQ_CONTAINER。
+func TestLifecycleRecoveryAfterNativeRecoveryExhaustion(t *testing.T) {
+	silenceLogging(t)
+	amqpURL := requireExternalBroker(t)
+	container := os.Getenv(rabbitMQContainerEnv)
+	if container == "" {
+		t.Skipf("set %s to run broker restart recovery test", rabbitMQContainerEnv)
+	}
+
+	queue := fmt.Sprintf("xamqp_lifecycle_exhausted_%d", time.Now().UnixNano())
+	cleanupTestQueue(t, amqpURL, queue)
+	conn, err := NewConn(amqpURL, WithConnectionOptionsReconnectInterval(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer conn.Close()
+
+	received := make(chan string, 256)
+	consumer, err := NewConsumer(conn, queue, WithConsumerOptionsQueueDurable)
+	if err != nil {
+		t.Fatalf("consumer failed: %v", err)
+	}
+	defer consumer.Close()
+	if err := consumer.Run(func(d Delivery) Action {
+		received <- string(d.Body)
+		return Ack
+	}); err != nil {
+		t.Fatalf("consumer Run failed: %v", err)
+	}
+	publisher, err := NewPublisher(conn)
+	if err != nil {
+		t.Fatalf("publisher failed: %v", err)
+	}
+	defer publisher.Close()
+
+	if !publishAndAwait(t, publisher, queue, "before-full-reconnect", received, 10*time.Second) {
+		t.Fatal("baseline round-trip failed")
+	}
+	initialGeneration := conn.connManager.ReconnectionCount()
+
+	// 无论测试在哪一步失败，都尽最大努力把用户提供的 RabbitMQ 容器恢复运行。
+	t.Cleanup(func() { _ = exec.Command("docker", "start", container).Run() })
+	if out, err := exec.Command("docker", "stop", "--time", "2", container).CombinedOutput(); err != nil {
+		t.Fatalf("stop RabbitMQ container failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	closedDeadline := time.Now().Add(10 * time.Second)
+	for !conn.IsClosed() && time.Now().Before(closedDeadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !conn.IsClosed() {
+		t.Fatal("connection never observed the stopped broker")
+	}
+
+	// 默认原生恢复最多重试 5 次；100ms 基础间隔加每次最多 500ms 抖动，
+	// 6 秒足以确保进入 xamqp 的兜底 full reconnect，而不是仅测到原生恢复。
+	time.Sleep(6 * time.Second)
+	if out, err := exec.Command("docker", "start", container).CombinedOutput(); err != nil {
+		t.Fatalf("start RabbitMQ container failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	readyDeadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := exec.Command("docker", "exec", container, "rabbitmq-diagnostics", "-q", "ping").Run(); err == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			t.Fatal("RabbitMQ container did not become ready after restart")
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	reconnectDeadline := time.Now().Add(60 * time.Second)
+	for conn.connManager.ReconnectionCount() <= initialGeneration && time.Now().Before(reconnectDeadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := conn.connManager.ReconnectionCount(); got <= initialGeneration {
+		t.Fatalf("full reconnect did not occur: generation before=%d after=%d", initialGeneration, got)
+	}
+	if !publishAndAwait(t, publisher, queue, "after-full-reconnect", received, 60*time.Second) {
+		t.Fatal("consumer/publisher did not recover after native recovery exhaustion and full reconnect")
+	}
+	t.Logf("DATA full reconnect: connection generation %d -> %d; round-trip recovered",
+		initialGeneration, conn.connManager.ReconnectionCount())
+}
+
+// TestPublisherHonorsBrokerBlockedAlarm 通过降低 RabbitMQ 内存高水位制造真实
+// connection.blocked / connection.unblocked 通知，验证 Publisher 会暂停并在告警
+// 解除后恢复发布。测试结束会把当前测试容器的高水位恢复为其原配置值 0.6。
+func TestPublisherHonorsBrokerBlockedAlarm(t *testing.T) {
+	silenceLogging(t)
+	amqpURL := requireExternalBroker(t)
+	container := os.Getenv(rabbitMQContainerEnv)
+	if container == "" {
+		t.Skipf("set %s to run broker resource-alarm test", rabbitMQContainerEnv)
+	}
+
+	conn, err := NewConn(amqpURL)
+	if err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	defer conn.Close()
+	publisher, err := NewPublisher(conn)
+	if err != nil {
+		t.Fatalf("publisher failed: %v", err)
+	}
+	defer publisher.Close()
+
+	restore := func() error {
+		return exec.Command("docker", "exec", container, "rabbitmqctl",
+			"set_vm_memory_high_watermark", "0.6").Run()
+	}
+	t.Cleanup(func() {
+		if err := restore(); err != nil {
+			t.Logf("failed to restore RabbitMQ memory watermark: %v", err)
+		}
+	})
+	if out, err := exec.Command("docker", "exec", container, "rabbitmqctl",
+		"set_vm_memory_high_watermark", "0.000001").CombinedOutput(); err != nil {
+		t.Fatalf("set RabbitMQ memory alarm failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	blockedDeadline := time.Now().Add(20 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		err = publisher.PublishWithContext(ctx, []byte("blocked-probe"), []string{"xamqp_blocked_probe"})
+		cancel()
+		if errors.Is(err, ErrPublishBlocked) {
+			break
+		}
+		if time.Now().After(blockedDeadline) {
+			t.Fatalf("Publisher never observed RabbitMQ connection.blocked; last publish error: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if err := restore(); err != nil {
+		t.Fatalf("clear RabbitMQ memory alarm failed: %v", err)
+	}
+	unblockedDeadline := time.Now().Add(20 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err = publisher.PublishWithContext(ctx, []byte("unblocked-probe"), []string{"xamqp_blocked_probe"})
+		cancel()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrPublishBlocked) && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("publish after clearing alarm failed: %v", err)
+		}
+		if time.Now().After(unblockedDeadline) {
+			t.Fatalf("Publisher remained blocked after RabbitMQ alarm cleared: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Log("DATA broker blocking: publisher paused on memory alarm and resumed after alarm cleared")
 }
 
 // publishAndAwait 反复发布带标记的消息，直到消费者收到同一标记或超时。

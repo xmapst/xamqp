@@ -23,6 +23,33 @@ func waitForCondition(t *testing.T, timeout time.Duration, description string, c
 	}
 }
 
+// waitForNativeRecoveryExhaustion waits for amqp091-go to definitively give up
+// native recovery. A fixed delay cannot prove this phase transition: retry jitter
+// and slow CI hosts can make the configured attempts take longer than expected.
+func waitForNativeRecoveryExhaustion(t *testing.T, stateChanges <-chan *amqp.StateChanged, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case state, ok := <-stateChanges:
+			if !ok {
+				t.Fatal("connection state listener closed before reporting native recovery exhaustion")
+			}
+			if state.To != amqp.StateClosed {
+				continue
+			}
+			if state.Err == nil {
+				t.Fatal("connection closed gracefully instead of exhausting native recovery")
+			}
+			return
+		case <-timer.C:
+			t.Fatal("timed out waiting for native recovery to reach terminal StateClosed")
+		}
+	}
+}
+
 func currentConnection(conn *Conn) *amqp.Connection {
 	var current *amqp.Connection
 	_ = conn.connManager.WithConnection(func(c *amqp.Connection) error {
@@ -224,6 +251,8 @@ func TestFullReconnectRestoresConnChannelPublisherAndConsumer(t *testing.T) {
 		return ch
 	}()
 	oldDirectChannel := currentManagedChannel(direct)
+	connectionStates := make(chan *amqp.StateChanged, 8)
+	oldConn.NotifyStateChange(connectionStates)
 	connectionGeneration := conn.connManager.ReconnectionCount()
 	publisherGeneration := publisher.chanManager.ReconnectionCount()
 	consumerGeneration := consumer.chanManager.ReconnectionCount()
@@ -234,7 +263,7 @@ func TestFullReconnectRestoresConnChannelPublisherAndConsumer(t *testing.T) {
 		t.Fatalf("stop RabbitMQ failed: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 	waitForCondition(t, 10*time.Second, "Conn to observe broker outage", conn.IsClosed)
-	time.Sleep(6 * time.Second)
+	waitForNativeRecoveryExhaustion(t, connectionStates, 15*time.Second)
 	if out, err := exec.Command("docker", "start", container).CombinedOutput(); err != nil {
 		t.Fatalf("start RabbitMQ failed: %v (%s)", err, strings.TrimSpace(string(out)))
 	}

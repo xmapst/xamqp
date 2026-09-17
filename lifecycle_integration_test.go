@@ -24,6 +24,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const rabbitMQContainerEnv = "XAMQP_TEST_RABBITMQ_CONTAINER"
@@ -310,8 +312,12 @@ func TestLifecycleQueueDeletedRecovery(t *testing.T) {
 
 	// 删除队列，触发 broker 向消费者下发 basic.cancel。
 	mgmt := newManagementAPI(t, amqpURL)
-	code, _ := mgmt.do(t, http.MethodDelete, "/api/queues/%2F/"+url.PathEscape(queue))
+	code, body := mgmt.do(t, http.MethodDelete, "/api/queues/%2F/"+url.PathEscape(queue))
 	t.Logf("DATA queue-deleted: delete queue via management API -> HTTP %d", code)
+	if code != http.StatusNoContent {
+		t.Fatalf("delete queue via management API returned HTTP %d, want %d; body=%s",
+			code, http.StatusNoContent, strings.TrimSpace(string(body)))
+	}
 
 	// 消费者应重建通道、重新声明队列并重新订阅。
 	if !publishAndAwait(t, publisher, queue, "post-delete", received, 60*time.Second) {
@@ -363,6 +369,8 @@ func TestLifecycleRecoveryAfterNativeRecoveryExhaustion(t *testing.T) {
 		t.Fatal("baseline round-trip failed")
 	}
 	initialGeneration := conn.connManager.ReconnectionCount()
+	connectionStates := make(chan *amqp.StateChanged, 8)
+	currentConnection(conn).NotifyStateChange(connectionStates)
 
 	// 无论测试在哪一步失败，都尽最大努力把用户提供的 RabbitMQ 容器恢复运行。
 	t.Cleanup(func() { _ = exec.Command("docker", "start", container).Run() })
@@ -378,9 +386,9 @@ func TestLifecycleRecoveryAfterNativeRecoveryExhaustion(t *testing.T) {
 		t.Fatal("connection never observed the stopped broker")
 	}
 
-	// 默认原生恢复最多重试 5 次；100ms 基础间隔加每次最多 500ms 抖动，
-	// 6 秒足以确保进入 xamqp 的兜底 full reconnect，而不是仅测到原生恢复。
-	time.Sleep(6 * time.Second)
+	// 等到原生恢复明确进入带错误的终态，再启动 broker；这样后续
+	// 恢复必然来自 xamqp 的全连接重建，不依赖重试抖动和机器速度。
+	waitForNativeRecoveryExhaustion(t, connectionStates, 15*time.Second)
 	if out, err := exec.Command("docker", "start", container).CombinedOutput(); err != nil {
 		t.Fatalf("start RabbitMQ container failed: %v (%s)", err, strings.TrimSpace(string(out)))
 	}

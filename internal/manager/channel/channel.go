@@ -66,8 +66,13 @@ func New(connManager *connection.Manager, reconnectInterval time.Duration) (*Man
 		return nil, err
 	}
 
+	notifyCancelChan, stateCh := registerNotifyCancelOrClosed(ch)
+	if ch.IsClosed() {
+		chanManager.discardUninstalledChannel(ch, notifyCancelChan, stateCh)
+		return nil, amqp.ErrClosed
+	}
 	chanManager.channel = ch
-	go chanManager.startNotifyCancelOrClosed() // 异步监听通道关闭/取消事件
+	go chanManager.handleCancelOrStateChange(notifyCancelChan, stateCh)
 	return chanManager, nil
 }
 
@@ -86,8 +91,11 @@ func (m *Manager) getNewChannel() (*amqp.Channel, error) {
 	return ch, nil
 }
 
-// startNotifyCancelOrClosed 并行监听通道的取消（NotifyCancel）和生命周期
-// 变化（NotifyStateChange）事件。
+// registerNotifyCancelOrClosed 在指定通道上同步注册取消（NotifyCancel）
+// 和生命周期变化（NotifyStateChange）监听器。注册与事件处理特意拆开：
+// 新通道必须在对外安装前完成注册，而实际处理仍由 goroutine 异步执行。
+// 这样即使通道在安装后立刻关闭，终态事件也已有接收者，不会落入
+// “先安装、后启动 goroutine 注册”的窗口。
 //
 // basic.cancel（如队列被删除）不受 amqp091-go 原生恢复处理——它只在
 // 连接/通道层面重连时生效，对一个仍然存活的通道上单纯的消费者取消不起
@@ -100,19 +108,34 @@ func (m *Manager) getNewChannel() (*amqp.Channel, error) {
 // 遇到不可恢复错误，或者这次连接根本没有有效的 Recovery 配置）才说明
 // 这个通道对象已经报废，此时才兜底走 xamqp 自己的 reconnect() 全新通道
 // 流程。StateClosed 且 Err == nil 对应正常关闭，仅记录日志。
-func (m *Manager) startNotifyCancelOrClosed() {
-	notifyCancelChan := m.channel.NotifyCancel(make(chan string, 1))
+func registerNotifyCancelOrClosed(ch *amqp.Channel) (<-chan string, <-chan *amqp.StateChanged) {
 	stateCh := make(chan *amqp.StateChanged, 1)
-	m.channel.NotifyStateChange(stateCh)
-	m.handleCancelOrStateChange(notifyCancelChan, stateCh)
+	ch.NotifyStateChange(stateCh)
+	notifyCancelChan := ch.NotifyCancel(make(chan string, 1))
+	return notifyCancelChan, stateCh
 }
 
-// handleCancelOrStateChange 是 startNotifyCancelOrClosed 的事件循环部分，
+// discardUninstalledChannel cleans up a candidate channel that closed before it
+// could be installed. Its listeners still need consumers: a close racing with
+// registration may already have queued StateClosing/StateClosed, and leaving the
+// one-slot state channel unread would park amqp091-go's delivery goroutine.
+func (m *Manager) discardUninstalledChannel(ch *amqp.Channel, notifyCancelChan <-chan string, stateCh <-chan *amqp.StateChanged) {
+	go func() {
+		for range notifyCancelChan {
+		}
+	}()
+	go m.drainStateChanges(stateCh)
+	if err := ch.Close(); err != nil {
+		slog.Warn("error closing channel that became unavailable before installation", slog.Any("error", err))
+	}
+}
+
+// handleCancelOrStateChange 是通道取消/生命周期的事件循环部分，
 // 独立拆出便于在没有真实 broker 的环境下用手动驱动的 channel 单元测试其分支逻辑。
 //
 // NotifyCancel 与 NotifyStateChange 并行监听：两者中任意一个先触发需要
-// 处理的事件就 return（外层 reconnectLoop 成功后会重新调用 startNotifyCancelOrClosed
-// 监听新通道），未触发的那个分支若因通道对象被销毁而被关闭，读到零值后
+// 处理的事件就 return（reconnect() 安装新通道时会同步注册下一组
+// 监听器并启动新的处理协程），未触发的那个分支若因通道对象被销毁而被关闭，读到零值后
 // 置为 nil 防止忙轮询，让 select 只在有意义的分支上继续等待。
 func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stateCh <-chan *amqp.StateChanged) {
 	for {
@@ -257,7 +280,6 @@ func (m *Manager) reconnectLoop() bool {
 			attempt++
 		} else {
 			// 重连计数已在 reconnect() 内与通道装入原子地一起递增，此处不再重复递增。
-			go m.startNotifyCancelOrClosed() // 重连成功后继续监听新通道的异常
 			return true
 		}
 	}
@@ -305,6 +327,15 @@ func (m *Manager) reconnect() error {
 		}
 	}
 
+	// 先在尚未对外可见的新通道上注册监听器，再安装指针。
+	// 注册和安装都在同一把写锁的临界区内，Close 或业务调用无法
+	// 观察到一个尚未有生命周期监听器的当前通道。
+	notifyCancelChan, stateCh := registerNotifyCancelOrClosed(newChannel)
+	if newChannel.IsClosed() {
+		m.channelMu.Unlock()
+		m.discardUninstalledChannel(newChannel, notifyCancelChan, stateCh)
+		return amqp.ErrClosed
+	}
 	oldChannel := m.channel
 	m.channel = newChannel
 	// 在装入新通道的同一个写锁临界区内递增重连计数，使"当前通道"和
@@ -315,6 +346,7 @@ func (m *Manager) reconnect() error {
 	// 会导致同一个通道被注册两个监听者、每个事件被投递两次。
 	m.incrementReconnectionCount()
 	m.channelMu.Unlock()
+	go m.handleCancelOrStateChange(notifyCancelChan, stateCh)
 
 	// 先建立新通道，再关闭旧通道，防止期间有操作无通道可用
 	if oldChannel != nil {

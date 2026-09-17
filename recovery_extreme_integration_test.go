@@ -133,6 +133,8 @@ func TestExtremeConfirmedLoadSurvivesNativeAndFullReconnect(t *testing.T) {
 		func() bool { return confirmed.Load() >= 80 })
 
 	connectionGeneration := conn.connManager.ReconnectionCount()
+	connectionStates := make(chan *amqp.StateChanged, 8)
+	currentConnection(conn).NotifyStateChange(connectionStates)
 	t.Cleanup(func() { _ = exec.Command("docker", "start", container).Run() })
 	if out, err := exec.Command("docker", "stop", "--time", "2", container).CombinedOutput(); err != nil {
 		t.Fatalf("stop RabbitMQ failed: %v (%s)", err, strings.TrimSpace(string(out)))
@@ -141,7 +143,7 @@ func TestExtremeConfirmedLoadSurvivesNativeAndFullReconnect(t *testing.T) {
 	if confirmed.Load() == total {
 		t.Fatal("all messages finished before the full outage; stress test did not overlap active publishing")
 	}
-	time.Sleep(6 * time.Second)
+	waitForNativeRecoveryExhaustion(t, connectionStates, 15*time.Second)
 	startRabbitMQContainer(t, container)
 	waitForCondition(t, 60*time.Second, "fallback connection recovery", func() bool {
 		return conn.connManager.ReconnectionCount() > connectionGeneration && !conn.IsClosed()

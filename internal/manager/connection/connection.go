@@ -122,7 +122,7 @@ func New(url string, conf amqp.Config, reconnectInterval time.Duration) (*Manage
 		return nil, err
 	}
 	connManager.connection = conn
-	go connManager.startNotifyClose() // 监听连接关闭事件
+	connManager.startNotifyClose(conn) // 同步注册监听，再异步处理事件
 	// 注意：readUniversalBlockReceiver 不在这里启动。它只有在有 Publisher 通过
 	// NotifyBlockedSafe 真正注册阻塞通知时才会被启动（见 safe_wraps.go），此时
 	// universalNotifyBlockingReceiver 才会被注册进 m.connection.NotifyBlocked，
@@ -171,24 +171,14 @@ func (m *Manager) WithConnection(fn func(*amqp.Connection) error) error {
 	return fn(m.connection)
 }
 
-// startNotifyClose 通过 NotifyStateChange 监听连接的生命周期变化，
-// 原生恢复放弃时触发 xamqp 自己的兜底重连流程。
-//
-// amqp091-go 的原生恢复会原地复用同一个 *amqp.Connection：TCP 重连、
-// exchange/queue/binding 拓扑、消费者订阅全部由库自身透明重建，期间该
-// 连接对象上已注册的 NotifyBlocked 等监听者无需重新注册（resetState 不会
-// 清空这些监听者列表），所以中间态（StateReconnecting/StateOpen）xamqp
-// 不需要做任何事——下游 Publisher/Consumer 看到的始终是同一个连接对象，
-// 不存在需要"重新初始化"的东西。
-//
-// 只有终态 StateClosed 且 Err != nil（原生恢复重试耗尽、遇到不可恢复
-// 错误，或者这次连接根本没有有效的 Recovery 配置）才说明这个连接对象
-// 已经报废，此时才兜底走 xamqp 自己的 dial() 全新连接流程。
-// 优雅关闭（用户调用 Close()）对应 StateClosed 且 Err == nil，仅记录日志。
-func (m *Manager) startNotifyClose() {
+// startNotifyClose 在指定连接上同步注册监听，再异步处理生命周期事件。
+// 必须在连接对外可见前调用，且不能在 goroutine 中读取 m.connection：
+// 否则注册可能晚于连接关闭，或错误地监听到另一代连接。
+// 即便连接在注册前已关闭，handleStateChanges 也会通过通知通道关闭兜底。
+func (m *Manager) startNotifyClose(conn *amqp.Connection) {
 	stateCh := make(chan *amqp.StateChanged, 1)
-	m.connection.NotifyStateChange(stateCh)
-	m.handleStateChanges(stateCh)
+	conn.NotifyStateChange(stateCh)
+	go m.handleStateChanges(stateCh)
 }
 
 // handleStateChanges 是 startNotifyClose 的事件循环部分，独立拆出便于
@@ -203,15 +193,28 @@ func (m *Manager) handleStateChanges(stateCh <-chan *amqp.StateChanged) {
 		case amqp.StateClosed:
 			if sc.Err != nil {
 				slog.Error("native recovery exhausted, falling back to full reconnect", slog.Any("error", sc.Err))
-				m.reconnectLoop()
-				slog.Warn("successfully reconnected to amqp server")
-				_ = m.dispatcher.Dispatch(sc.Err)
+				m.fallbackReconnect(sc.Err)
 			} else {
 				slog.Info("amqp connection closed gracefully")
 			}
 			return
 		default:
 		}
+	}
+
+	// 注册时连接可能已经终止：amqp091-go 此时只关闭通知通道，
+	// 不回放 StateClosed 或关闭原因。不能将缺失事件误认为主动关闭。
+	if m.IsPermanentlyClosed() {
+		return
+	}
+	slog.Warn("amqp connection state notifications closed without terminal event, falling back to full reconnect")
+	m.fallbackReconnect(amqp.ErrClosed)
+}
+
+func (m *Manager) fallbackReconnect(err error) {
+	if m.reconnectLoop() {
+		slog.Warn("successfully reconnected to amqp server")
+		_ = m.dispatcher.Dispatch(err)
 	}
 }
 
@@ -229,10 +232,11 @@ func (m *Manager) incrementReconnectionCount() {
 }
 
 // reconnectLoop 持续重连直到成功或管理器被关闭，使用带抖动的指数退避。
+// 返回 true 表示成功安装新连接；返回 false 表示管理器已关闭，不能广播恢复成功。
 //
 // 等待退避时间时 select 着 closeSignal：Close() 会立刻打断等待并退出，
 // 不必等满一整个退避周期才发现管理器已经关闭。
-func (m *Manager) reconnectLoop() {
+func (m *Manager) reconnectLoop() bool {
 	attempt := 0
 
 	for {
@@ -241,7 +245,7 @@ func (m *Manager) reconnectLoop() {
 		select {
 		case <-m.closeSignal:
 			slog.Info("connection manager closed, stopping reconnect loop")
-			return
+			return false
 		case <-time.After(delay):
 		}
 
@@ -249,14 +253,13 @@ func (m *Manager) reconnectLoop() {
 		if err != nil {
 			if errors.Is(err, errClosed) {
 				slog.Info("connection manager closed, stopping reconnect loop")
-				return
+				return false
 			}
 			slog.Error("error reconnecting to amqp server", slog.Any("error", err))
 			attempt++
 		} else {
 			m.incrementReconnectionCount()
-			go m.startNotifyClose() // 重连成功后继续监听新连接
-			return
+			return true
 		}
 	}
 }
@@ -283,6 +286,7 @@ func (m *Manager) reconnect() error {
 	}
 
 	oldConnection := m.connection
+	m.startNotifyClose(conn)
 	m.connection = conn
 
 	// 旧连接关闭时，amqp091-go 会关闭所有通过 NotifyBlocked 注册在其上的通道，

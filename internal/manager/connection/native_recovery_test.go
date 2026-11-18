@@ -130,6 +130,49 @@ func TestHandleStateChanges_ExhaustedRecoveryEntersReconnectLoop(t *testing.T) {
 	}
 }
 
+// TestHandleStateChanges_MissingTerminalEvent 模拟 NotifyStateChange 在连接
+// 已关闭后才注册：库直接关闭通知通道，不回放 StateClosed。
+func TestHandleStateChanges_MissingTerminalEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		managerClosed bool
+		transient     bool
+		wantReconnect bool
+	}{
+		{name: "closed_before_registration", wantReconnect: true},
+		{name: "closed_after_transient_events", transient: true, wantReconnect: true},
+		{name: "manager_explicitly_closed", managerClosed: true},
+		{name: "manager_closed_after_transient_events", managerClosed: true, transient: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spy := &spyLogger{}
+			installSpyLogger(t, spy)
+			// 与已有耗尽恢复测试一样，预先关闭停止信号以阻止真实拨号。
+			// closed 字段单独控制管理器是否主动关闭，而非依赖底层通知。
+			stop := make(chan struct{})
+			close(stop)
+			m := &Manager{
+				connectionMu:      &sync.RWMutex{},
+				closed:            tc.managerClosed,
+				closeSignal:       stop,
+				ReconnectInterval: time.Hour,
+			}
+			stateCh := make(chan *amqp.StateChanged, 1)
+			if tc.transient {
+				stateCh <- &amqp.StateChanged{To: amqp.StateReconnecting}
+			}
+			close(stateCh)
+
+			m.handleStateChanges(stateCh)
+
+			if got := spy.hasInfoContaining("waiting to attempt to reconnect"); got != tc.wantReconnect {
+				t.Fatalf("entered reconnect loop = %v, want %v", got, tc.wantReconnect)
+			}
+			// dispatcher 故意留空：中止重连后若仍广播成功事件，测试会 panic。
+		})
+	}
+}
+
 // TestNew_DefaultsRecoveryWhenUnset 验证 New() 在调用方没有显式设置
 // amqp.Config.Recovery 时，会自动填充一份带有效 MaxRetryCount 的默认值，
 // 而不是让调用方安静地跑在"没有原生恢复"的状态下。

@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"sync"
 	"time"
-
+	
 	amqp "github.com/rabbitmq/amqp091-go"
-
+	
 	"github.com/xmapst/xamqp/internal/backoff"
 	"github.com/xmapst/xamqp/internal/dispatcher"
 	"github.com/xmapst/xamqp/internal/manager/connection"
@@ -29,20 +29,19 @@ type Manager struct {
 	channel             *amqp.Channel          // 底层 AMQP 通道，受 channelMu 保护
 	connManager         *connection.Manager    // 所属的连接管理器，重连时用于借用连接开新通道
 	channelMu           *sync.RWMutex          // 读写锁：允许多读单写
-	closed              bool                   // 是否已调用 Close，受 channelMu 保护，防止与在途重连竞争
 	closeSignal         chan struct{}          // Close() 时关闭，用于立刻打断正在等待退避的 reconnectLoop
-	confirmMode         bool                   // 是否已进入 confirm 模式，受 channelMu 保护；重连时据此在新通道上重新启用
-	reconnectInterval   time.Duration          // 首次重连等待时间（指数退避的基础值）
-	reconnectionCount   uint                   // 累计重连次数，用于确认消息的 ID 计算
 	reconnectionCountMu *sync.Mutex            // 单独保护重连计数，避免与 channelMu 产生锁竞争
 	dispatcher          *dispatcher.Dispatcher // 重连事件广播器
-
 	// notifyConnReconnect 订阅底层连接的重连成功事件，用于让 reconnectLoop
 	// 在连接刚恢复时跳过剩余的退避等待、立即重试，而不是坐等自己独立的
 	// 退避计时器。New() 中默认指向 connManager.NotifyReconnect；单独抽成
 	// 字段是为了在没有真实 connManager 的单元测试里可以替换为假实现，
 	// 不必依赖需要真实拨号才能构造出来的 connection.Manager。
 	notifyConnReconnect func() (<-chan error, chan<- struct{})
+	reconnectInterval   time.Duration // 首次重连等待时间（指数退避的基础值）
+	reconnectionCount   uint          // 累计重连次数，用于确认消息的 ID 计算
+	closed              bool          // 是否已调用 Close，受 channelMu 保护，防止与在途重连竞争
+	confirmMode         bool          // 是否已进入 confirm 模式，受 channelMu 保护；重连时据此在新通道上重新启用
 }
 
 // errClosed 表示通道管理器已被 Close，重连循环应立即停止，不再创建新通道。
@@ -60,12 +59,12 @@ func New(connManager *connection.Manager, reconnectInterval time.Duration) (*Man
 		dispatcher:          dispatcher.New(),
 	}
 	chanManager.notifyConnReconnect = connManager.NotifyReconnect
-
+	
 	ch, err := chanManager.getNewChannel()
 	if err != nil {
 		return nil, err
 	}
-
+	
 	notifyCancelChan, stateCh := registerNotifyCancelOrClosed(ch)
 	if ch.IsClosed() {
 		chanManager.discardUninstalledChannel(ch, notifyCancelChan, stateCh)
@@ -87,7 +86,7 @@ func (m *Manager) getNewChannel() (*amqp.Channel, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	
 	return ch, nil
 }
 
@@ -156,7 +155,7 @@ func (m *Manager) handleCancelOrStateChange(notifyCancelChan <-chan string, stat
 			// 这里在离开前起一个纯排空协程，读到通道关闭为止（投递完终态
 			// StateClosed 后库会关闭它），让那个投递协程能够跑完并退出。
 			go m.drainStateChanges(stateCh)
-
+			
 			slog.Error("attempting to reconnect to amqp server after cancel", slog.String("tag", tag))
 			if m.reconnectLoop() {
 				slog.Warn("successfully reconnected to amqp server after cancel")
@@ -209,14 +208,14 @@ func (m *Manager) drainStateChanges(stateCh <-chan *amqp.StateChanged) {
 func (m *Manager) ReconnectionCount() uint {
 	m.reconnectionCountMu.Lock()
 	defer m.reconnectionCountMu.Unlock()
-
+	
 	return m.reconnectionCount
 }
 
 func (m *Manager) incrementReconnectionCount() {
 	m.reconnectionCountMu.Lock()
 	defer m.reconnectionCountMu.Unlock()
-
+	
 	m.reconnectionCount++
 }
 
@@ -242,10 +241,10 @@ func (m *Manager) incrementReconnectionCount() {
 // 了——退化为原来"各自独立退避"的行为，不会更差，只是没能加速。
 func (m *Manager) reconnectLoop() bool {
 	attempt := 0
-
+	
 	connReconnected, unsubscribeConnReconnect := m.notifyConnReconnect()
 	defer func() { unsubscribeConnReconnect <- struct{}{} }()
-
+	
 	for {
 		delay := backoff.Delay(m.reconnectInterval, attempt)
 		slog.Info("waiting to attempt to reconnect to amqp server", slog.Duration("delay", delay))
@@ -257,7 +256,7 @@ func (m *Manager) reconnectLoop() bool {
 			slog.Info("underlying connection recovered, retrying immediately instead of waiting out the backoff")
 		case <-time.After(delay):
 		}
-
+		
 		err := m.reconnect()
 		if err != nil {
 			if errors.Is(err, errClosed) {
@@ -307,7 +306,7 @@ func (m *Manager) reconnect() error {
 	if err != nil {
 		return err
 	}
-
+	
 	m.channelMu.Lock()
 	if m.closed {
 		m.channelMu.Unlock()
@@ -316,7 +315,7 @@ func (m *Manager) reconnect() error {
 		}
 		return errClosed
 	}
-
+	
 	if m.confirmMode {
 		if cerr := newChannel.Confirm(false); cerr != nil {
 			m.channelMu.Unlock()
@@ -326,7 +325,7 @@ func (m *Manager) reconnect() error {
 			return fmt.Errorf("failed to re-arm confirm mode after reconnect: %w", cerr)
 		}
 	}
-
+	
 	// 先在尚未对外可见的新通道上注册监听器，再安装指针。
 	// 注册和安装都在同一把写锁的临界区内，Close 或业务调用无法
 	// 观察到一个尚未有生命周期监听器的当前通道。
@@ -347,7 +346,7 @@ func (m *Manager) reconnect() error {
 	m.incrementReconnectionCount()
 	m.channelMu.Unlock()
 	go m.handleCancelOrStateChange(notifyCancelChan, stateCh)
-
+	
 	// 先建立新通道，再关闭旧通道，防止期间有操作无通道可用
 	if oldChannel != nil {
 		if err = oldChannel.Close(); err != nil {
@@ -365,20 +364,20 @@ func (m *Manager) reconnect() error {
 func (m *Manager) Close() error {
 	m.channelMu.Lock()
 	defer m.channelMu.Unlock()
-
+	
 	if m.closed {
 		return nil
 	}
 	m.closed = true
 	close(m.closeSignal)
-
+	
 	slog.Info("closing channel manager...")
 	err := m.channel.Close()
 	if err != nil {
 		slog.Error("close error", slog.Any("error", err))
 		return err
 	}
-
+	
 	return nil
 }
 
@@ -396,7 +395,7 @@ func (m *Manager) lockChannelRead(ctx context.Context) error {
 	if m.channelMu.TryRLock() {
 		return nil
 	}
-
+	
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
